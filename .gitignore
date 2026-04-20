@@ -1,0 +1,13 @@
+.env
+.venv/
+.venv-train/
+__pycache__/
+node_modules/
+.next/
+artifacts/
+hf_cache/
+ollama_models/
+chroma_db/
+*.gguf
+*.safetensors
+*.xlsx

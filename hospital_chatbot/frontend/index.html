@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>UP Hospital Backend Status</title>
+  <style>
+    body { font-family: Inter, sans-serif; margin: 0; background: #f7f9fb; color: #191c1e; }
+    .wrap { max-width: 960px; margin: 48px auto; padding: 0 16px; }
+    .card { background: #fff; border-radius: 16px; padding: 22px; box-shadow: 0 20px 40px rgba(44,0,80,.06); margin-bottom: 14px; }
+    h1 { color: #4b0082; margin: 0 0 8px; }
+    .btn { display: inline-block; border-radius: 10px; padding: 10px 14px; text-decoration: none; color: #fff; background: linear-gradient(120deg,#2e0052,#4b0082); font-weight: 700; margin-right: 8px; }
+    code { background: #f2f4f6; padding: 2px 6px; border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="card">
+      <h1>UP Hospital RAG Backend</h1>
+      <p>Backend พร้อมใช้งานแล้วสำหรับ frontend แบบ static และ Next.js</p>
+      <p>Next.js frontend URL: <code>http://localhost:3000</code></p>
+      <p>Chat API: <code>POST http://127.0.0.1:8000/chat</code></p>
+      <a class="btn" href="/admin-ui">เปิด Admin UI</a>
+      <a class="btn" href="/health" target="_blank">ตรวจสอบ Health</a>
+    </section>
+  </main>
+</body>
+</html>

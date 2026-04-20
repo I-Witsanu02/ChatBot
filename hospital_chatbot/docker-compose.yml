@@ -1,0 +1,77 @@
+version: '3.9'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: deployment/docker/Dockerfile.backend
+    container_name: hospital-backend
+    environment:
+      WORKBOOK_PATH: /app/data/master_kb.xlsx
+      KNOWLEDGE_JSONL: /app/data/knowledge.jsonl
+      KNOWLEDGE_CSV: /app/data/knowledge.csv
+      VALIDATION_REPORT_PATH: /app/data/kb_validation_report.json
+      MANIFEST_PATH: /app/data/kb_manifest.json
+      EVAL_REPORT_PATH: /app/data/evaluation_report.json
+      AUDIT_LOG_PATH: /app/logs/audit.jsonl
+      SERVING_MODEL_LOCK_PATH: /app/data/serving_model.lock.json
+      CHROMA_DB_DIR: /app/chroma_db
+      CHROMA_COLLECTION: hospital_faq
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      ADMIN_AUTH_MODE: ${ADMIN_AUTH_MODE:-either}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me}
+      ADMIN_VIEWER_USERNAME: ${ADMIN_VIEWER_USERNAME:-}
+      ADMIN_VIEWER_PASSWORD: ${ADMIN_VIEWER_PASSWORD:-}
+      ADMIN_EDITOR_USERNAME: ${ADMIN_EDITOR_USERNAME:-}
+      ADMIN_EDITOR_PASSWORD: ${ADMIN_EDITOR_PASSWORD:-}
+      ADMIN_ADMIN_USERNAME: ${ADMIN_ADMIN_USERNAME:-}
+      ADMIN_ADMIN_PASSWORD: ${ADMIN_ADMIN_PASSWORD:-}
+    volumes:
+      - ./data:/app/data
+      - ./chroma_db:/app/chroma_db
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  nextjs:
+    build:
+      context: ./nextjs_frontend
+      dockerfile: Dockerfile
+    container_name: hospital-nextjs
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: /api
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: hospital-nginx
+    depends_on:
+      - backend
+      - nextjs
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deployment/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deployment/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./deployment/nginx/certs:/etc/nginx/certs:ro
+      - ./deployment/nginx/.htpasswd:/etc/nginx/.htpasswd:ro
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: deployment/docker/Dockerfile.backend
+    container_name: hospital-dashboard
+    command: ["streamlit", "run", "dashboard/dashboard_app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    profiles: ["dashboard"]
+    restart: unless-stopped

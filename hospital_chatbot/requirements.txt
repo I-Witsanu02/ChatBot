@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pydantic
+pandas
+python-multipart
+requests
+chromadb
+sentence-transformers
+streamlit
+openpyxl
+uv

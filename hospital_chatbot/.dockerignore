@@ -1,0 +1,12 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+node_modules
+nextjs_frontend/node_modules
+.next
+chroma_db
+logs
+backups
+.git

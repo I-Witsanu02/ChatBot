@@ -1,0 +1,35 @@
+{
+  "training": {
+    "framework": "unsloth",
+    "base_model_hf": "Qwen/Qwen2.5-7B-Instruct",
+    "adapter_dir": "up_hospital_lora",
+    "adapter_type": "lora",
+    "notes": "Original fine-tune script uses Qwen/Qwen2.5-7B-Instruct as the base model."
+  },
+  "serving": {
+    "provider": "ollama",
+    "mode": "temporary_local_runtime_model",
+    "model_name": "scb10x/typhoon2.5-qwen3-4b:latest",
+    "base_model_reference": "scb10x/typhoon2.5-qwen3-4b:latest",
+    "endpoint": "http://127.0.0.1:11434",
+    "must_match_training_base": false,
+    "disallow_runtime_model_override": false,
+    "notes": "Temporary serving model selected from locally installed Ollama models for Thai conversational quality. Replace with merged fine-tuned custom model later if required."
+  },
+  "embedding": {
+    "provider": "ollama",
+    "model_name": "bge-m3:latest",
+    "endpoint": "http://127.0.0.1:11434"
+  },
+  "reranker": {
+    "provider": "hybrid_lexical_vector",
+    "model_name": "BAAI/bge-reranker-v2-m3"
+  },
+  "deployment_notes": {
+    "preferred_current_runtime": {
+      "embedding": "bge-m3:latest",
+      "chat": "scb10x/typhoon2.5-qwen3-4b:latest"
+    },
+    "future_upgrade_path": "Merge LoRA with Qwen2.5-7B-Instruct, export GGUF, and replace the temporary Ollama chat model when the fine-tuned model is ready."
+  }
+}

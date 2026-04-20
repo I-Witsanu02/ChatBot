@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hospital Admin</title>
+  <style>
+    :root { --primary:#4b0082; --bg:#f7f9fb; --text:#191c1e; --muted:#5e6470; }
+    body { font-family: Inter, sans-serif; background:var(--bg); margin:0; color:var(--text); }
+    .wrap { max-width: 1100px; margin: 24px auto; padding: 0 16px; }
+    .card { background:#fff; border-radius:16px; padding:20px; box-shadow:0 10px 24px rgba(44,0,80,.06); margin-bottom:16px; }
+    h1,h2,h3 { margin-top:0; }
+    button { background:var(--primary); color:#fff; border:0; border-radius:10px; padding:10px 14px; font-weight:700; cursor:pointer; }
+    button.secondary { background:#eef0f6; color:#2b3240; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    pre { white-space:pre-wrap; background:#f2f4f6; padding:12px; border-radius:10px; overflow:auto; }
+    input, select { width:100%; max-width:420px; padding:10px 12px; border-radius:10px; border:1px solid #d7dce5; margin-bottom:10px; }
+    input[type=file] { display:block; margin-bottom:10px; }
+    .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap:16px; }
+    .role-badge { display:inline-block; padding:6px 10px; border-radius:999px; background:#efe6fb; color:#4b0082; font-weight:700; }
+    .muted { color:var(--muted); }
+    .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="card">
+      <h1>Hospital Admin Console</h1>
+      <p class="muted">หน้าจอนี้ใช้สำหรับอัปโหลดฐานความรู้, rebuild index, รัน evaluation และตรวจสอบสถานะระบบ</p>
+      <div class="row">
+        <span class="role-badge" id="roleBadge">ยังไม่ได้เข้าสู่ระบบ</span>
+        <button class="secondary" onclick="clearAuth()">ออกจากระบบ</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>เข้าสู่ระบบผู้ดูแล</h2>
+      <div class="grid">
+        <div>
+          <h3>เข้าแบบ Token</h3>
+          <input id="adminToken" type="password" placeholder="วาง X-Admin-Token" />
+          <button onclick="saveTokenAuth()">บันทึก Token</button>
+        </div>
+        <div>
+          <h3>เข้าแบบ Username / Password</h3>
+          <input id="adminUser" type="text" placeholder="Username" />
+          <input id="adminPass" type="password" placeholder="Password" />
+          <button onclick="saveBasicAuth()">บันทึก Basic Auth</button>
+        </div>
+      </div>
+      <p class="muted">รองรับ role แบบ viewer / editor / admin ตามการตั้งค่าใน environment ของระบบ</p>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Upload workbook</h2>
+        <input id="workbook" type="file" accept=".xlsx,.xls" />
+        <button id="uploadBtn" onclick="uploadWorkbook()">อัปโหลด</button>
+      </div>
+      <div class="card">
+        <h2>Maintenance</h2>
+        <div class="row">
+          <button id="rebuildBtn" onclick="rebuild()">Rebuild KB + Index</button>
+          <button id="evalBtn" onclick="runEvaluation()">Run Evaluation</button>
+          <button class="secondary" onclick="loadStatus()">Refresh Status</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card"><h2>Status</h2><pre id="status">ยังไม่ได้โหลด</pre></div>
+      <div class="card"><h2>Model Config</h2><pre id="model">ยังไม่ได้โหลด</pre></div>
+    </div>
+    <div class="card"><h2>Evaluation Summary</h2><pre id="evaluation">ยังไม่ได้โหลด</pre></div>
+    <div class="card"><h2>Audit (admin only)</h2><pre id="audit">ยังไม่ได้โหลด</pre></div>
+    <div class="grid">
+      <div class="card"><h2>Request Logs</h2><pre id="requestLogs">ยังไม่ได้โหลด</pre></div>
+      <div class="card"><h2>Analytics Summary</h2><pre id="analytics">ยังไม่ได้โหลด</pre></div>
+    </div>
+    <div class="card">
+      <h2>Human-in-the-loop Queue</h2>
+      <div class="row">
+        <button class="secondary" onclick="loadHandoffQueue()">Refresh Queue</button>
+      </div>
+      <pre id="handoffQueue">ยังไม่ได้โหลด</pre>
+      <h3>ตอบกลับเคส</h3>
+      <input id="ticketId" type="number" placeholder="Ticket ID" />
+      <input id="responderName" type="text" placeholder="ชื่อผู้ตอบ เช่น PR Officer" />
+      <textarea id="handoffResponse" placeholder="พิมพ์ข้อความตอบกลับถึงผู้ใช้" style="width:100%;min-height:120px;border:1px solid #d7dce5;border-radius:10px;padding:10px 12px;"></textarea>
+      <div class="row">
+        <button onclick="respondHandoff()">ส่งคำตอบและปิดเคส</button>
+      </div>
+    </div>
+  </main>
+  <script>
+    const AUTH_STORAGE_KEY = 'hospital_admin_auth';
+    let currentRole = null;
+
+    function getSavedAuth() {
+      try { return JSON.parse(localStorage.getItem(AUTH_STORAGE_KEY) || '{}'); } catch { return {}; }
+    }
+
+    function saveAuth(obj) {
+      localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(obj));
+    }
+
+    function clearAuth() {
+      localStorage.removeItem(AUTH_STORAGE_KEY);
+      currentRole = null;
+      updateRoleBadge(null);
+      updatePermissions();
+      alert('ล้างข้อมูลเข้าสู่ระบบแล้ว');
+    }
+
+    function updateRoleBadge(role, authType) {
+      const el = document.getElementById('roleBadge');
+      if (!role) {
+        el.textContent = 'ยังไม่ได้เข้าสู่ระบบ';
+        return;
+      }
+      el.textContent = `เข้าสู่ระบบแล้ว: ${role} (${authType || 'unknown'})`;
+    }
+
+    function authHeaders() {
+      const auth = getSavedAuth();
+      const headers = {};
+      if (auth.token) headers['X-Admin-Token'] = auth.token;
+      if (auth.basic) headers['Authorization'] = `Basic ${auth.basic}`;
+      return headers;
+    }
+
+    function saveTokenAuth() {
+      const token = document.getElementById('adminToken').value.trim();
+      if (!token) return alert('กรุณากรอก token');
+      saveAuth({ token });
+      verifyAuth();
+    }
+
+    function saveBasicAuth() {
+      const user = document.getElementById('adminUser').value.trim();
+      const pass = document.getElementById('adminPass').value;
+      if (!user || !pass) return alert('กรุณากรอก username และ password');
+      saveAuth({ basic: btoa(`${user}:${pass}`) });
+      verifyAuth();
+    }
+
+    function updatePermissions() {
+      const editorOrAbove = currentRole === 'editor' || currentRole === 'admin';
+      const adminOnly = currentRole === 'admin';
+      document.getElementById('uploadBtn').disabled = !editorOrAbove;
+      document.getElementById('rebuildBtn').disabled = !editorOrAbove;
+      document.getElementById('evalBtn').disabled = !editorOrAbove;
+      if (!adminOnly) {
+        document.getElementById('audit').textContent = 'ต้องใช้สิทธิ์ admin';
+      }
+    }
+
+    async function api(path, options = {}) {
+      const headers = { ...(options.headers || {}), ...authHeaders() };
+      const res = await fetch(path, { ...options, headers });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`HTTP ${res.status}: ${text}`);
+      }
+      return res.json();
+    }
+
+    async function verifyAuth() {
+      try {
+        const data = await api('/admin/auth/check');
+        currentRole = data.role;
+        updateRoleBadge(data.role, data.auth_type);
+        updatePermissions();
+        await loadStatus();
+      } catch (err) {
+        currentRole = null;
+        updateRoleBadge(null);
+        updatePermissions();
+        alert('เข้าสู่ระบบไม่สำเร็จ: ' + err.message);
+      }
+    }
+
+    async function loadStatus() {
+      try {
+        document.getElementById('status').textContent = JSON.stringify(await api('/admin/status'), null, 2);
+        document.getElementById('model').textContent = JSON.stringify(await api('/admin/model-config'), null, 2);
+        document.getElementById('evaluation').textContent = JSON.stringify(await api('/admin/evaluation/summary'), null, 2);
+        document.getElementById('requestLogs').textContent = JSON.stringify(await api('/admin/request-logs?limit=50'), null, 2);
+        document.getElementById('analytics').textContent = JSON.stringify(await api('/admin/analytics/summary'), null, 2);
+        await loadHandoffQueue();
+        if (currentRole === 'admin') {
+          document.getElementById('audit').textContent = JSON.stringify(await api('/admin/audit?limit=50'), null, 2);
+        }
+      } catch (err) {
+        document.getElementById('status').textContent = err.message;
+      }
+    }
+
+    async function uploadWorkbook() {
+      const input = document.getElementById('workbook');
+      if (!input.files.length) return alert('กรุณาเลือกไฟล์');
+      const form = new FormData();
+      form.append('file', input.files[0]);
+      const headers = authHeaders();
+      const res = await fetch('/admin/upload-workbook', { method:'POST', body:form, headers });
+      const text = await res.text();
+      if (!res.ok) return alert(text);
+      alert(text);
+      await loadStatus();
+    }
+
+    async function rebuild() {
+      try {
+        const data = await api('/admin/rebuild', { method:'POST' });
+        alert(JSON.stringify(data, null, 2));
+        await loadStatus();
+      } catch (err) { alert(err.message); }
+    }
+
+    async function runEvaluation() {
+      try {
+        const data = await api('/admin/run-evaluation', { method:'POST' });
+        alert(JSON.stringify(data, null, 2));
+        await loadStatus();
+      } catch (err) { alert(err.message); }
+    }
+
+    async function loadHandoffQueue() {
+      try {
+        document.getElementById('handoffQueue').textContent = JSON.stringify(await api('/admin/handoff/queue?status=open&limit=100'), null, 2);
+      } catch (err) {
+        document.getElementById('handoffQueue').textContent = err.message;
+      }
+    }
+
+    async function respondHandoff() {
+      try {
+        const ticketId = Number(document.getElementById('ticketId').value);
+        const responder = document.getElementById('responderName').value.trim() || 'admin';
+        const responseText = document.getElementById('handoffResponse').value.trim();
+        if (!ticketId || !responseText) return alert('กรุณากรอก ticket id และข้อความตอบกลับ');
+        const data = await api('/admin/handoff/respond', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ticket_id: ticketId, responder, response_text: responseText, close_ticket: true })
+        });
+        alert(JSON.stringify(data, null, 2));
+        document.getElementById('handoffResponse').value = '';
+        await loadHandoffQueue();
+      } catch (err) {
+        alert(err.message);
+      }
+    }
+
+    // Init
+    updatePermissions();
+    const saved = getSavedAuth();
+    if (saved.token || saved.basic) {
+      verifyAuth();
+    }
+  </script>
+</body>
+</html>

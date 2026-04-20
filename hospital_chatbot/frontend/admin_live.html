@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>UPH Admin Live Takeover</title>
+  <style>
+    body { font-family: Inter, system-ui, sans-serif; margin:0; background:#f6f8fb; color:#1f2937; }
+    .wrap { max-width: 1280px; margin: 24px auto; padding: 0 16px; }
+    .grid { display:grid; grid-template-columns: 380px 1fr; gap:16px; }
+    .card { background:#fff; border-radius:16px; padding:16px; box-shadow:0 10px 24px rgba(0,0,0,.06); }
+    h1,h2,h3 { margin:0 0 12px; }
+    .muted { color:#6b7280; }
+    .tickets { display:flex; flex-direction:column; gap:10px; max-height:72vh; overflow:auto; }
+    .ticket { border:1px solid #e5e7eb; border-radius:12px; padding:12px; cursor:pointer; }
+    .ticket.active { border-color:#4b0082; box-shadow:0 0 0 2px rgba(75,0,130,.12); }
+    .pill { display:inline-block; padding:4px 8px; border-radius:999px; background:#f3e8ff; color:#6b21a8; font-size:12px; font-weight:700; }
+    .pill.open { background:#fff7ed; color:#b45309; }
+    .pill.in_progress { background:#eff6ff; color:#1d4ed8; }
+    .pill.resolved { background:#ecfdf5; color:#047857; }
+    .meta { font-size:12px; color:#6b7280; margin-top:8px; }
+    .messages { min-height:56vh; max-height:56vh; overflow:auto; display:flex; flex-direction:column; gap:10px; margin-bottom:16px; }
+    .msg { padding:12px 14px; border-radius:14px; max-width:80%; white-space:pre-wrap; }
+    .msg.user { align-self:flex-start; background:#f3f4f6; }
+    .msg.admin { align-self:flex-end; background:#ede9fe; }
+    textarea, input { width:100%; box-sizing:border-box; border:1px solid #d1d5db; border-radius:12px; padding:10px 12px; font:inherit; }
+    textarea { min-height:120px; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    button { border:0; border-radius:12px; padding:10px 14px; background:#4b0082; color:#fff; font-weight:700; cursor:pointer; }
+    button.secondary { background:#eef2ff; color:#312e81; }
+    .empty { color:#6b7280; padding:12px 0; }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="row" style="justify-content:space-between; margin-bottom:16px;">
+      <div>
+        <h1>Admin Live Takeover</h1>
+        <div class="muted">รับคิวที่ AI มั่นใจต่ำ ตอบแทน AI แบบใกล้เคียง real-time</div>
+      </div>
+      <div class="row">
+        <input id="responderName" type="text" placeholder="ชื่อเจ้าหน้าที่" style="width:220px;" />
+        <button class="secondary" onclick="refreshQueue()">Refresh Queue</button>
+      </div>
+    </div>
+    <div class="grid">
+      <section class="card">
+        <h2>คิวคำถาม</h2>
+        <div class="tickets" id="tickets"></div>
+      </section>
+      <section class="card">
+        <h2>ห้องตอบสด</h2>
+        <div id="conversationMeta" class="muted">เลือกเคสจากด้านซ้าย</div>
+        <div class="messages" id="messages"></div>
+        <div class="row" style="margin-bottom:8px;">
+          <button onclick="claimTicket()">รับเคสนี้</button>
+          <button class="secondary" onclick="sendLiveMessage(false)">ส่งข้อความ</button>
+          <button onclick="sendLiveMessage(true)">ส่งและปิดเคส</button>
+        </div>
+        <textarea id="replyText" placeholder="พิมพ์ข้อความตอบแทน AI ถึงผู้ใช้"></textarea>
+      </section>
+    </div>
+  </main>
+  <script>
+    const AUTH_STORAGE_KEY = 'hospital_admin_auth';
+    let selectedTicket = null;
+    let selectedTicketMessages = [];
+
+    function authHeaders() {
+      try {
+        const auth = JSON.parse(localStorage.getItem(AUTH_STORAGE_KEY) || '{}');
+        const headers = {};
+        if (auth.token) headers['X-Admin-Token'] = auth.token;
+        if (auth.basic) headers['Authorization'] = `Basic ${auth.basic}`;
+        return headers;
+      } catch {
+        return {};
+      }
+    }
+
+    async function api(path, options = {}) {
+      const headers = { ...(options.headers || {}), ...authHeaders() };
+      const res = await fetch(path, { ...options, headers });
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+      return res.json();
+    }
+
+    function renderTickets(items) {
+      const root = document.getElementById('tickets');
+      if (!items.length) {
+        root.innerHTML = '<div class="empty">ไม่มีคิวที่ต้อง takeover ตอนนี้</div>';
+        return;
+      }
+      root.innerHTML = items.map((item) => `
+        <div class="ticket ${selectedTicket && selectedTicket.id === item.id ? 'active' : ''}" onclick="selectTicket(${item.id})">
+          <div class="row" style="justify-content:space-between;">
+            <strong>เคส #${item.id}</strong>
+            <span class="pill ${item.status}">${item.status}</span>
+          </div>
+          <div style="margin-top:8px;">${item.question}</div>
+          <div class="meta">หมวด: ${item.category || '-'} | confidence: ${(item.confidence ?? 0).toFixed(2)} | assigned: ${item.assigned_to || '-'}</div>
+        </div>
+      `).join('');
+      window.__tickets = items;
+    }
+
+    function renderMessages() {
+      const box = document.getElementById('messages');
+      if (!selectedTicket) {
+        box.innerHTML = '<div class="empty">เลือกเคสก่อน</div>';
+        return;
+      }
+      const messages = [
+        { role: 'user', text: selectedTicket.question },
+        ...selectedTicketMessages.map((m) => ({ role: 'admin', text: `${m.responder || 'admin'}: ${m.response_text}` })),
+      ];
+      box.innerHTML = messages.map((m) => `<div class="msg ${m.role}">${m.text}</div>`).join('');
+      box.scrollTop = box.scrollHeight;
+    }
+
+    async function refreshQueue() {
+      const data = await api('/admin/handoff/queue?status=all&limit=100');
+      renderTickets(data.items || []);
+      if (selectedTicket) {
+        const fresh = (data.items || []).find((item) => item.id === selectedTicket.id);
+        if (fresh) selectedTicket = fresh;
+      }
+      renderMessages();
+    }
+
+    async function selectTicket(id) {
+      selectedTicket = (window.__tickets || []).find((item) => item.id === id) || null;
+      document.getElementById('conversationMeta').textContent = selectedTicket ? `เคส #${selectedTicket.id} | session ${selectedTicket.session_id || '-'} | หมวด ${selectedTicket.category || '-'}` : 'เลือกเคสจากด้านซ้าย';
+      if (!selectedTicket?.session_id) {
+        selectedTicketMessages = [];
+        renderTickets(window.__tickets || []);
+        renderMessages();
+        return;
+      }
+      const data = await api(`/chat/admin-replies?session_id=${encodeURIComponent(selectedTicket.session_id)}&limit=100`);
+      selectedTicketMessages = (data.items || []).reverse();
+      renderTickets(window.__tickets || []);
+      renderMessages();
+    }
+
+    async function claimTicket() {
+      if (!selectedTicket) return alert('กรุณาเลือกเคส');
+      const responder = document.getElementById('responderName').value.trim() || 'admin';
+      await api('/admin/handoff/takeover', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ticket_id: selectedTicket.id, responder }),
+      });
+      await refreshQueue();
+      await selectTicket(selectedTicket.id);
+    }
+
+    async function sendLiveMessage(closeTicket) {
+      if (!selectedTicket) return alert('กรุณาเลือกเคส');
+      const responder = document.getElementById('responderName').value.trim() || 'admin';
+      const messageText = document.getElementById('replyText').value.trim();
+      if (!messageText) return alert('กรุณาพิมพ์ข้อความ');
+      await api('/admin/handoff/live-message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ticket_id: selectedTicket.id, responder, message_text: messageText, close_ticket: closeTicket }),
+      });
+      document.getElementById('replyText').value = '';
+      await refreshQueue();
+      await selectTicket(selectedTicket.id);
+    }
+
+    const queueSource = new EventSource('/admin/handoff/stream');
+    queueSource.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      renderTickets(data.items || []);
+    };
+
+    refreshQueue().catch((err) => { document.getElementById('tickets').innerHTML = `<div class="empty">${err.message}</div>`; });
+  </script>
+</body>
+</html>
