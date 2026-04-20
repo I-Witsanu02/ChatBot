@@ -36,7 +36,7 @@ python scripts/build_kb.py --input data/master_kb.xlsx \
 python scripts/reindex_kb.py --knowledge data/knowledge.jsonl --db-dir chroma_db --collection hospital_faq --reset
 python scripts/generate_test_set.py --knowledge data/knowledge.jsonl --output data/regression_test_set_realistic.jsonl
 python scripts/evaluate.py --test-set data/regression_test_set_realistic.jsonl --report-output data/evaluation_report.json --details-output data/evaluation_details.jsonl --manifest data/kb_manifest.json
-uvicorn backend.app:app --reload --port 8000
+uvicorn backend.app:app --reload --port 8001
 ```
 
 ## One-click deploy ฝั่งโมเดล
@@ -123,4 +123,3 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml up --build -d
 - docs/admin_manual_th.md
 - docs/ops_runbook_th.md
 - docs/handoff_acceptance_form_th.md
-

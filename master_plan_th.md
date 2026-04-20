@@ -1,6 +1,6 @@
-#  Master Plan
+# Master Plan
 
- เน้นทำให้โปรเจกต์พร้อม demo/staging และพร้อมส่งต่อทีมไอที/ทีมเว็บ โดยเพิ่ม 4 กลุ่มงานหลัก:
+เน้นทำให้โปรเจกต์พร้อม demo/staging และพร้อมส่งต่อทีมไอที/ทีมเว็บ โดยเพิ่ม 4 กลุ่มงานหลัก:
 
 1. **Training data expansion จาก 38 verified rows**
    - เพิ่ม script `training/expand_sft_from_verified_kb.py`
@@ -9,7 +9,7 @@
 
 2. **Fine-tune pipeline สำหรับเครื่องส่วนตัว RTX4050 6GB**
    - ปรับ `training/train_uph_chatbot_unsloth.py`
-   - รองรับ local model cache/offline training
+   - รองรับ local model cache/offline training บนไดรฟ์ D:
    - preload tokenizer ก่อน train เพื่อลดปัญหา network ระหว่างเริ่มเทรน
 
 3. **Deployable demo / mockup stack**
@@ -18,9 +18,10 @@
    - เพิ่มคู่มือว่าวาง widget ที่ไหนของหน้า demo
 
 4. **Merge -> GGUF -> Ollama**
-   - เพิ่ม `training/merge_lora_qwen25_3b.py`
-   - เพิ่ม `scripts/v20_merge_gguf_ollama_windows.cmd`
-   - ใช้ชื่อโมเดล `UPH_ChatBot`
+   - ใช้สคริปต์ `training/merge_lora_qwen25_3b.py`
+   - แปลงและควอนไทซ์ (q8_0) โดยใช้ `convert_hf_to_gguf.py`
+   - ใช้ชื่อโมเดล `uph_chatbot` (ตัวพิมพ์เล็กตามกฎ Ollama ล่าสุด)
+   - ย้ายพื้นที่จัดเก็บ Ollama ไปที่ `D:\ollama_models` เพื่อแก้ปัญหาความจุเต็ม
 
 ## ข้อเสนอเชิงระบบ
 
