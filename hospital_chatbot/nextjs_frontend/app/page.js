@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8001";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "/api";
 const navItems = ["บริการตรวจ", "นัดหมาย", "สิทธิการรักษา", "ติดต่อเรา"];
 const departments = [
   { title: "General Practice", detail: "ให้บริการตรวจรักษาโรคทั่วไปและให้คำปรึกษาสุขภาพเบื้องต้นอย่างครอบคลุม" },
