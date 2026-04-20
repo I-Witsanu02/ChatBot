@@ -10,3 +10,9 @@ chroma_db
 logs
 backups
 .git
+artifacts
+hf_cache
+ollama_models
+*.gguf
+*.safetensors
+*.xlsx
