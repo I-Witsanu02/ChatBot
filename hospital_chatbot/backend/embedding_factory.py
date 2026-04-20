@@ -63,10 +63,39 @@ class OllamaEmbeddingFunction:
         return f"ollama::{self.model_name}"
 
 
+class TyphoonEmbeddingFunction:
+    """Typhoon Embedding Function (OpenAI-compatible) for Cloud Deployment."""
+    def __init__(self, api_key: str | None = None, model_name: str = "pythai-sentence-bert-base-v2"):
+        self.api_key = api_key or os.getenv("TYPHOON_API_KEY")
+        self.model_name = model_name
+        self.base_url = "https://api.opentyphoon.ai/v1"
+
+    def __call__(self, input: Sequence[str]) -> list[list[float]]:
+        if not self.api_key:
+            raise RuntimeError("TYPHOON_API_KEY is not set.")
+        
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise ImportError("Please install 'openai' library to use Typhoon embeddings.")
+
+        client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+        response = client.embeddings.create(
+            input=list(input),
+            model=self.model_name
+        )
+        return [data.embedding for data in response.data]
+
+    def name(self) -> str:
+        return f"typhoon::{self.model_name}"
+
+
 def build_embedding_function(provider: str | None = None, *, model_name: str | None = None):
     provider = (provider or EMBEDDING_PROVIDER).strip().lower()
     if provider == "ollama":
         return OllamaEmbeddingFunction(model_name=model_name or OLLAMA_EMBED_MODEL)
+    if provider == "typhoon":
+        return TyphoonEmbeddingFunction(model_name=model_name or "pythai-sentence-bert-base-v2")
     if provider in {"sentence-transformers", "sentence_transformers", "hf"}:
         from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -72,9 +74,27 @@ class ChromaRetriever:
         self._client = chromadb.PersistentClient(path=db_dir)
         existing = {c.name for c in self._client.list_collections()}
         if collection_name not in existing:
-            raise RuntimeError(
-                f"Chroma collection '{collection_name}' not found in '{db_dir}'. Run scripts/reindex_kb.py first."
-            )
+            print(f"⚠️  Chroma collection '{collection_name}' not found. Attempting auto-rebuild...")
+            data_dir = Path(__file__).resolve().parents[1] / "data"
+            scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
+            kb_jsonl = data_dir / "knowledge.jsonl"
+            
+            # If knowledge.jsonl doesn't exist, we might need to build it from master_kb.xlsx first
+            if not kb_jsonl.exists():
+                 print(f"⚠️  {kb_jsonl} missing. Building from Excel...")
+                 subprocess.run([sys.executable, str(scripts_dir / "build_kb.py")], check=True)
+
+            reindex_cmd = [
+                sys.executable,
+                str(scripts_dir / "reindex_kb.py"),
+                "--knowledge", str(kb_jsonl),
+                "--db-dir", db_dir,
+                "--collection", collection_name,
+                "--reset"
+            ]
+            subprocess.run(reindex_cmd, check=True)
+            print("✅ Auto-rebuild complete.")
+            
         self._collection = self._client.get_collection(name=collection_name, embedding_function=self._embedding_fn)
 
     def search(self, query: str, top_k: int = 10, category: str | None = None) -> list[RetrievalCandidate]:

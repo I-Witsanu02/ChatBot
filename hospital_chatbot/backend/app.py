@@ -103,6 +103,12 @@ CHROMA_DB_DIR = os.getenv("CHROMA_DB_DIR", "chroma_db")
 CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "hospital_faq")
 FOLLOWUP_TTL_SECONDS = int(os.getenv("SESSION_MEMORY_TTL_SECONDS", "1800"))
 
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
+TYPHOON_API_KEY = os.getenv("TYPHOON_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+TYPHOON_MODEL = os.getenv("TYPHOON_MODEL", "typhoon-v1.5x-70b-instruct")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
@@ -742,7 +748,34 @@ def _generate_answer(query: str, top: RetrievalCandidate, candidates: list[Retri
     model_state = runtime_summary(SERVING_LOCK_PATH)
     t_start = time.time()
 
-    if use_llm and model_state.get("configured_provider") == "ollama":
+    if use_llm and LLM_PROVIDER in {"typhoon", "openai"}:
+        try:
+            from openai import OpenAI
+            api_key = TYPHOON_API_KEY if LLM_PROVIDER == "typhoon" else OPENAI_API_KEY
+            base_url = "https://api.opentyphoon.ai/v1" if LLM_PROVIDER == "typhoon" else None
+            model_name = TYPHOON_MODEL if LLM_PROVIDER == "typhoon" else OPENAI_MODEL
+            
+            if not api_key:
+                logger.error("❌ %s API Key missing in environment — using KB fallback", LLM_PROVIDER.upper())
+            else:
+                client = OpenAI(api_key=api_key, base_url=base_url)
+                logger.info("🤖 %s call → model=%s query='%s'", LLM_PROVIDER.upper(), model_name, query[:60])
+                chat_completion = client.chat.completions.create(
+                    messages=build_llm_messages(query, top, candidates),
+                    model=model_name,
+                    temperature=0.1,
+                    max_tokens=1024,
+                )
+                content = chat_completion.choices[0].message.content.strip()
+                latency = round(time.time() - t_start, 2)
+                if content:
+                    logger.info("✅ %s answer returned in %.2fs", LLM_PROVIDER.upper(), latency)
+                    return content
+        except Exception as exc:
+            latency = round(time.time() - t_start, 2)
+            logger.error("❌ %s error after %.2fs: %s — using KB fallback", LLM_PROVIDER.upper(), latency, exc)
+
+    if use_llm and (LLM_PROVIDER == "ollama" or model_state.get("configured_provider") == "ollama"):
         model_name = model_state.get("runtime_model", "")
         endpoint = model_state.get("runtime_endpoint", "http://127.0.0.1:11434")
         try:
@@ -752,7 +785,7 @@ def _generate_answer(query: str, top: RetrievalCandidate, candidates: list[Retri
                 "stream": False,
                 "options": {"temperature": 0.1, "num_ctx": 2048},
             }
-            logger.info("🤖 LLM call → model=%s endpoint=%s query='%s'", model_name, endpoint, query[:60])
+            logger.info("🤖 LLM call (Ollama) → model=%s endpoint=%s query='%s'", model_name, endpoint, query[:60])
             response = requests.post(
                 f"{endpoint}/api/chat",
                 json=payload,
