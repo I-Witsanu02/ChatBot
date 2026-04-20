@@ -1406,3 +1406,29 @@ def admin_run_evaluation(principal: AdminPrincipal = Depends(require_role("edito
     subprocess.run(cmd, check=True)
     append_audit_event(AUDIT_LOG_PATH, {"event_type": "run_evaluation"})
     return json.loads(report_path.read_text(encoding="utf-8"))
+
+
+# ── Static UI Routes ─────────────────────────────────────────────────────────
+
+@app.get("/admin-ui")
+def get_admin_ui():
+    """Serves the static admin.html console."""
+    admin_path = FRONTEND_DIR / "admin.html"
+    if not admin_path.exists():
+        raise HTTPException(status_code=404, detail="admin.html not found")
+    return FileResponse(admin_path)
+
+
+@app.get("/guide")
+def get_guide():
+    """Serves the static index.html or guide page."""
+    guide_path = FRONTEND_DIR / "index.html"
+    if not guide_path.exists():
+        raise HTTPException(status_code=404, detail="index.html not found")
+    return FileResponse(guide_path)
+
+
+@app.get("/")
+def get_root():
+    """Simple root redirect or status message."""
+    return {"status": "UP Hospital Chatbot API", "version": "20.0.0", "admin_ui": "/admin-ui"}
