@@ -22,21 +22,32 @@ DEFAULT_OUTPUT = "regression_test_set_realistic.jsonl"
 SEED = 3407
 
 OUT_OF_SCOPE_QUERIES = [
-    "ช่วยวินิจฉัยอาการให้หน่อย",
-    "ควรกินยาอะไรเมื่อเป็นไข้",
-    "มะเร็งรักษาหายไหม",
-    "ผื่นแบบนี้อันตรายไหม",
-    "ตั้งครรภ์กินยานี้ได้ไหม",
+    "ช่วยวินิจฉัยอาการให้หน่อย", "ควรกินยาอะไรเมื่อเป็นไข้", "มะเร็งรักษาหายไหม", "ผื่นแบบนี้อันตรายไหม", "ตั้งครรภ์กินยานี้ได้ไหม",
+    "ซ่อมรถที่ไหน", "พยากรณ์อากาศวันนี้", "ผลบอลเมื่อคืน", "สอนทำอาหารหน่อย", "ซื้อของออนไลน์ยังไง",
+    "อยากกู้เงิน", "ราคาบิทคอยน์", "จองตั๋วเครื่องบิน", "แนะนำหนังน่าดู", "หิวข้าวมาก"
 ]
 
-GIBBERISH_QUERIES = ["ฟหก", "กฟก", "sb;]", ";yd:uo", "asdfg"]
+GIBBERISH_QUERIES = [
+    "ฟหก", "กฟก", "sb;]", ";yd:uo", "asdfg", "12345", "!!!???", "....", "test", "ลองเทส",
+    "ะาิีึื", "กขค", "abcde", "qwerty", "zxcvb", "000000"
+]
 
-POLITE_PREFIXES = ["ขอสอบถาม", "รบกวนสอบถาม", "อยากทราบ", "ขอถามหน่อย"]
+POLITE_PREFIXES = ["ขอสอบถาม", "รบกวนสอบถาม", "อยากทราบ", "ขอถามหน่อย", "สวัสดีค่ะ ขอถามเรื่อง", "ไม่ทราบว่า", "รบกวนขอข้อมูล"]
 COLLOQUIAL_PATTERNS = [
     "{question} ได้มั้ย",
     "{question} ยังไงครับ",
     "{category} {question}",
     "ถ้าจะ{question}ต้องทำยังไง",
+    "สนใจ{question}",
+    "อยากได้ข้อมูล{question}",
+    "ถามเรื่อง{question}หน่อยค่ะ",
+    "ช่วยบอก{question}หน่อย",
+    "ขอรายละเอียด{question}",
+    "จะ{question}ได้ที่ไหน",
+    "{question} ราคา",
+    "{question} ติดต่อ",
+    "มี{question}ไหม",
+    "{category} มี {question} หรือเปล่า",
 ]
 TYPO_MAP = {
     "นัด": "นัฐ",
@@ -45,24 +56,27 @@ TYPO_MAP = {
     "รักษา": "รักสา",
     "ค่าใช้จ่าย": "ค่าไช้จ่าย",
     "แพทย์": "แพทยื",
+    "ตรวจ": "ตรจ",
+    "บุคคล": "บุคล",
+    "ทันตกรรม": "ทันตะ",
+}
+CATEGORY_ALIAS_CASES = {
+    "การจัดการนัดหมาย": ["เลื่อนนัด", "จองคิว", "พบหมอ", "นัดหมอ", "ยกเลิกนัด", "เปลี่ยนนัด"],
+    "ตารางแพทย์และเวลาทำการ": ["ตารางแพทย์", "หมอ", "แพทย์", "หมอเข้าวันไหน", "ตารางออกตรวจ", "เวลาทำการ"],
+    "คลินิกทันตกรรม": ["หมอฟัน", "ทำฟัน", "ปวดฟัน", "ถอนฟัน", "ขูดหินปูน"],
+    "ศูนย์ไตเทียม": ["ฟอกไต", "ไตเทียม", "ล้างไต", "ฟอกเลือด"],
+    "สูตินรีเวช": ["ฝากครรภ์", "ตรวจภายใน", "คลินิกสตรี", "คลินิกแม่และเด็ก"],
+    "ประเมินค่าใช้จ่ายทั่วไป": ["สิทธิการรักษา", "ย้ายสิทธิ", "ค่าใช้จ่าย", "เวชระเบียน", "สิทธิ"],
+    "วัคซีน": ["วัก", "ฉีดวัคซีน", "วัคซีนhpv", "ราคาวัคซีน"],
+    "สวัสดิการวัคซีนนักศึกษา": ["วัคซีนสำหรับนักศึกษา", "วัคซีนนักศึกษา", "นศ. ฉีดวัคซีน", "สิทธิวัคซีนนักศึกษา"],
+    "ธนาคารเลือดและบริจาคเลือด": ["บริจาคเลือด", "ธนาคารเลือด", "เลือด", "ให้เลือด"],
+    "กลุ่มงานบุคคล": ["สมัครงาน", "รับสมัครงาน", "งานบุคคล", "hr"],
+    "ตรวจสุขภาพรายบุคคล": ["ตรวจสุขภาพ", "โปรแกรมตรวจสุขภาพ", "ตรวจประจำปี", "แพ็กเกจตรวจสุขภาพ"],
+    "ตรวจสุขภาพองค์กรและสิทธิเบิกจ่า": ["ตรวจสุขภาพองค์กร", "เบิกจ่าย", "เบิกตรง", "ตรวจสุขภาพบริษัท"],
+    "การขอเอกสารทางการแพทย์": ["ใบรับรองแพทย์", "ขอเวชระเบียน", "ขอใบรับรอง", "ใบแพทย์"],
 }
 TIME_SENSITIVE_KEYWORDS = ["ราคา", "ค่าใช้จ่าย", "วัคซีน", "ตารางแพทย์", "เวลาทำการ", "นัด"]
-CATEGORY_ALIAS_CASES = {
-    "การจัดการนัดหมาย": ["เลื่อนนัด", "จองคิว", "พบหมอ"],
-    "ตารางแพทย์และเวลาทำการ": ["ตารางแพทย์", "หมอ", "แพทย์"],
-    "คลินิกทันตกรรม": ["หมอฟัน", "ทำฟัน", "ปวดฟัน"],
-    "ศูนย์ไตเทียม": ["ฟอกไต", "ไตเทียม"],
-    "สูตินรีเวช": ["ฝากครรภ์", "ตรวจภายใน"],
-    "ประเมินค่าใช้จ่ายทั่วไป": ["สิทธิการรักษา", "ย้ายสิทธิ"],
-    "วัคซีน": ["วัก", "ฉีดวัคซีน"],
-    "สวัสดิการวัคซีนนักศึกษา": ["วัคซีนสำหรับนักศึกษา", "วัคซีนนักศึกษา"],
-    "ค่าใช้จ่าย": ["บริจาคเลือด", "ธนาคารเลือด", "เลือด"],
-    "กลุ่มงานบุคคล": ["สมัครงาน", "รับสมัครงาน"],
-    "ตรวจสุขภาพรายบุคคล": ["ตรวจสุขภาพ", "โปรแกรมตรวจสุขภาพ"],
-    "ตรวจสุขภาพองค์กรและสิทธิเบิกจ่า": ["ตรวจสุขภาพองค์กร", "เบิกจ่าย"],
-    "การขอเอกสารทางการแพทย์": ["ใบรับรองแพทย์", "ขอเวชระเบียน"],
-}
-FOLLOW_UP_CASES = ["ราคาเท่าไหร่", "ติดต่อที่ไหน", "เปิดวันไหน", "เข้าได้เลยไหม", "มีไหม"]
+FOLLOW_UP_CASES = ["ราคาเท่าไหร่", "ติดต่อที่ไหน", "เปิดวันไหน", "เข้าได้เลยไหม", "มีไหม", "ราคา", "ที่ไหน", "เมื่อไหร่"]
 
 
 def load_records(path: Path) -> list[dict[str, Any]]:
@@ -106,9 +120,19 @@ def make_cases(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         category = rec["category"]
         rid = rec["id"]
         rows.append({"id": f"exact::{rid}", "question": q, "expected_route": "answer", "expected_source_id": rid, "expected_category": category, "case_type": "exact"})
-        rows.append({"id": f"polite::{rid}", "question": f"{random.choice(POLITE_PREFIXES)}{q}", "expected_route": "answer", "expected_source_id": rid, "expected_category": category, "case_type": "polite_paraphrase"})
-        rows.append({"id": f"colloquial::{rid}", "question": random.choice(COLLOQUIAL_PATTERNS).format(question=q, category=category), "expected_route": "answer", "expected_source_id": rid, "expected_category": category, "case_type": "colloquial"})
-        rows.append({"id": f"typo::{rid}", "question": add_typos(q), "expected_route": "answer", "expected_source_id": rid, "expected_category": category, "case_type": "typo"})
+        
+        # Add multiple polite variations
+        for idx, prefix in enumerate(random.sample(POLITE_PREFIXES, 3)):
+            rows.append({"id": f"polite::{rid}::{idx}", "question": f"{prefix}{q}", "expected_route": "answer", "expected_source_id": rid, "expected_category": category, "case_type": "polite_paraphrase"})
+        
+        # Add multiple colloquial variations
+        for idx, pattern in enumerate(random.sample(COLLOQUIAL_PATTERNS, 5)):
+            rows.append({"id": f"colloquial::{rid}::{idx}", "question": pattern.format(question=q, category=category), "expected_route": "answer", "expected_source_id": rid, "expected_category": category, "case_type": "colloquial"})
+        
+        # Add multiple typo variations
+        for idx in range(2):
+            rows.append({"id": f"typo::{rid}::{idx}", "question": add_typos(q), "expected_route": "answer", "expected_source_id": rid, "expected_category": category, "case_type": "typo"})
+        
         if needs_time_sensitive_case(rec):
             rows.append({"id": f"time::{rid}", "question": f"ตอนนี้{q}", "expected_route": "answer", "expected_source_id": rid, "expected_category": category, "case_type": "time_sensitive"})
         if category not in seen_categories:

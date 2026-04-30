@@ -6,6 +6,7 @@ as a fallback for offline debugging.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Sequence
 
@@ -15,7 +16,7 @@ EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "ollama").strip().lower()
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
 OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "bge-m3:latest")
 SENTENCE_TRANSFORMERS_MODEL = os.getenv("SENTENCE_TRANSFORMERS_EMBED_MODEL", "paraphrase-multilingual-MiniLM-L12-v2")
-OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "60"))
+OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "15"))
 
 
 class OllamaEmbeddingFunction:
@@ -23,41 +24,41 @@ class OllamaEmbeddingFunction:
         self.base_url = base_url.rstrip("/")
         self.model_name = model_name
 
-    def _embed_api(self, texts: Sequence[str]) -> list[list[float]]:
+    def __call__(self, input: Sequence[str]) -> list[list[float]]:
+        # Chroma expects a list of embeddings (list of lists of floats)
+        texts = [input] if isinstance(input, str) else list(input)
+        
+        # Defensive flattening
+        flat_texts = []
+        for t in texts:
+            if isinstance(t, list):
+                flat_texts.extend(t)
+            else:
+                flat_texts.append(t)
+
+        payload = {"model": self.model_name, "input": flat_texts}
+        with open("ollama_debug.log", "a", encoding="utf-8") as f:
+            import json
+            f.write(f"DEBUG: sending payload: {json.dumps(payload, ensure_ascii=False)[:300]}\n")
+
         response = requests.post(
             f"{self.base_url}/api/embed",
-            json={"model": self.model_name, "input": list(texts)},
+            json=payload,
             timeout=OLLAMA_TIMEOUT_SECONDS,
         )
+        if response.status_code != 200:
+            with open("ollama_debug.log", "a", encoding="utf-8") as f:
+                f.write(f"ERROR: {response.status_code}: {response.text}\n")
         response.raise_for_status()
         data = response.json()
-        embeds = data.get("embeddings") or []
-        if not embeds:
-            raise RuntimeError("Ollama /api/embed returned no embeddings")
-        return embeds
+        return data.get("embeddings") or []
 
-    def _embeddings_api(self, texts: Sequence[str]) -> list[list[float]]:
-        embeddings: list[list[float]] = []
-        for text in texts:
-            response = requests.post(
-                f"{self.base_url}/api/embeddings",
-                json={"model": self.model_name, "prompt": text},
-                timeout=OLLAMA_TIMEOUT_SECONDS,
-            )
-            response.raise_for_status()
-            data = response.json()
-            emb = data.get("embedding")
-            if not emb:
-                raise RuntimeError("Ollama /api/embeddings returned no embedding")
-            embeddings.append(emb)
-        return embeddings
+    def embed_query(self, input: str) -> list[float]:
+        # Return a single embedding (list of floats)
+        return self([input])[0]
 
-    # ✅ แก้ไขตรงนี้: เปลี่ยนจาก texts เป็น input ตามมาตรฐานใหม่ของ ChromaDB
-    def __call__(self, input: Sequence[str]) -> list[list[float]]:
-        try:
-            return self._embed_api(input)
-        except Exception:
-            return self._embeddings_api(input)
+    def embed_documents(self, input: Sequence[str]) -> list[list[float]]:
+        return self(input)
 
     def name(self) -> str:
         return f"ollama::{self.model_name}"

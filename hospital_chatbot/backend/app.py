@@ -12,6 +12,7 @@ V20 fixes:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -23,6 +24,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
@@ -55,6 +57,7 @@ from .prompts import (
     build_clarification_options,
     build_clarification_text,
     build_followup_hint_text,
+    build_grounded_llm_messages,
     build_llm_messages,
     display_category_name,
     emergency_text,
@@ -84,8 +87,10 @@ DATA_DIR = PROJECT_ROOT / "data"
 LOG_DIR = PROJECT_ROOT / "logs"
 FRONTEND_DIR = PROJECT_ROOT / "frontend"
 SCRIPTS_DIR = PROJECT_ROOT / "scripts"
+SCHEDULE_IMAGE_DIR = DATA_DIR / "ตารางออกตรวจแพทย์"
+HEALTH_CHECK_IMAGE_DIR = DATA_DIR / "ตรวจสุขภาพประจำปี"
 
-WORKBOOK_PATH = Path(os.getenv("WORKBOOK_PATH", str(DATA_DIR / "master_kb.xlsx")))
+WORKBOOK_PATH = Path(os.getenv("WORKBOOK_PATH", str(DATA_DIR / "AIคำถามคำตอบงานสื่อสาร01.04.69.xlsx")))
 KNOWLEDGE_JSONL = Path(os.getenv("KNOWLEDGE_JSONL", str(DATA_DIR / "knowledge.jsonl")))
 KNOWLEDGE_CSV = Path(os.getenv("KNOWLEDGE_CSV", str(DATA_DIR / "knowledge.csv")))
 VALIDATION_REPORT_PATH = Path(os.getenv("VALIDATION_REPORT_PATH", str(DATA_DIR / "kb_validation_report.json")))
@@ -94,6 +99,12 @@ EVAL_REPORT_PATH = Path(os.getenv("EVAL_REPORT_PATH", str(DATA_DIR / "evaluation
 AUDIT_LOG_PATH = Path(os.getenv("AUDIT_LOG_PATH", str(LOG_DIR / "audit.jsonl")))
 SERVING_LOCK_PATH = Path(os.getenv("SERVING_MODEL_LOCK_PATH", str(PROJECT_ROOT / DEFAULT_LOCK_PATH)))
 ANALYTICS_DB_PATH = Path(os.getenv("ANALYTICS_DB_PATH", str(DATA_DIR / "chatbot_analytics.db")))
+
+ALLOWED_ASSET_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".pdf"}
+ASSET_ROOTS: dict[str, Path] = {
+    "schedule": SCHEDULE_IMAGE_DIR,
+    "health-check": HEALTH_CHECK_IMAGE_DIR,
+}
 
 HITL_CONFIDENCE_THRESHOLD = float(os.getenv("HITL_CONFIDENCE_THRESHOLD", "0.60"))
 HITL_FALLBACK_ALWAYS = os.getenv("HITL_FALLBACK_ALWAYS", "true").strip().lower() in {"1", "true", "yes", "y"}
@@ -108,6 +119,11 @@ TYPHOON_API_KEY = os.getenv("TYPHOON_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TYPHOON_MODEL = os.getenv("TYPHOON_MODEL", "typhoon-v1.5x-70b-instruct")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# kb_exact: returns raw KB answer for matches; llm_grounded: lets LLM paraphrase with KB context
+ANSWER_MODE = os.getenv("ANSWER_MODE", "kb_exact").strip().lower()
+RAG_GROUNDED_LLM = os.getenv("RAG_GROUNDED_LLM", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
+MENU_MODE = os.getenv("MENU_MODE", "tree_first").strip().lower()
+FOLLOWUP_MODE = os.getenv("FOLLOWUP_MODE", "slot_first").strip().lower()
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -116,6 +132,15 @@ async def _lifespan(application: FastAPI):
     logger.info("🚀 Hospital Chatbot API starting up…")
     init_request_log_db(ANALYTICS_DB_PATH)
     logger.info("✅ Analytics DB ready: %s", ANALYTICS_DB_PATH)
+    try:
+        logger.info("⏳ Loading retriever and knowledge base…")
+        state.reload_retriever()
+        logger.info("✅ Retriever ready. %d records loaded.", len(state.records))
+    except Exception as exc:
+        logger.warning("⚠️  Retriever failed to load (will run in KB-only mode): %s", exc)
+        state.retriever = None
+        state.rebuild_catalog()
+        logger.info("📚 KB-only mode. %d records loaded from JSONL.", len(state.records))
     yield
     logger.info("🛑 Hospital Chatbot API shutting down.")
 
@@ -170,7 +195,8 @@ CATEGORY_ALIASES: dict[str, list[str]] = {
     ],
     "สวัสดิการวัคซีนนักศึกษา": [
         "วัคซีนนักศึกษา", "วัคซีนสำหรับนักศึกษา", "สิทธิวัคซีนนักศึกษา", "นักศึกษาฉีดวัคซีน",
-        "วัคซีนฟรีนักศึกษา", "วัคซีนนักศึกษา", "วัคซีน hpv นักศึกษา", "วัคซีนมะเร็งปากมดลูกฟรี",
+        "วัคซีนฟรีนักศึกษา", "วัคซีน hpv นักศึกษา", "วัคซีนมะเร็งปากมดลูกฟรี",
+        "นักศึกษา วัคซีน", "สิทธิ นักศึกษา", "ฟรี นักศึกษา", "hpv นักศึกษา",
     ],
     "ธนาคารเลือดและบริจาคเลือด": [
         "เลือด", "บริจาคเลือด", "ธนาคารเลือด", "ให้เลือด", "ธนาคารเลือดและบริจาคเลือด", "เลือดวันไหน", "ฟอกเลือด",
@@ -181,7 +207,7 @@ CATEGORY_ALIASES: dict[str, list[str]] = {
     "ตรวจสุขภาพรายบุคคล": [
         "ตรวจสุขภาพ", "ตรวจร่างกาย", "แพ็กเกจตรวจสุขภาพ", "โปรแกรมตรวจสุขภาพ", "เช็กสุขภาพ", "ตรวจสุขภาพทั่วไป", "ตรจสุขภาพ",
     ],
-    "ตรวจสุขภาพองค์กรและสิทธิเบิกจ่า": [
+    "ตรวจสุขภาพองค์กรและสิทธิเบิกจ่าย": [
         "ตรวจสุขภาพองค์กร", "ตรวจสุขภาพหมู่คณะ", "ตรวจสุขภาพหน่วยงาน", "ตรวจสุขภาพบริษัท", "เบิกจ่าย", "สิทธิเบิกจ่าย",
         "เบิกตรง", "ตรวจสุขภาพพนักงาน",
     ],
@@ -196,14 +222,28 @@ TOPIC_ALIAS_OVERRIDES: dict[str, tuple[str, str | None]] = {
     "วัคซีนนักศึกษา": ("สวัสดิการวัคซีนนักศึกษา", None),
     "สิทธิวัคซีนนักศึกษา": ("สวัสดิการวัคซีนนักศึกษา", None),
     "นักศึกษาฉีดวัคซีน": ("สวัสดิการวัคซีนนักศึกษา", None),
+    "นักศึกษา วัคซีน": ("สวัสดิการวัคซีนนักศึกษา", None),
+    "สิทธิ นักศึกษา": ("สวัสดิการวัคซีนนักศึกษา", None),
+    "ฟรี นักศึกษา": ("สวัสดิการวัคซีนนักศึกษา", None),
+    "hpv นักศึกษา": ("สวัสดิการวัคซีนนักศึกษา", None),
+    "วัคซีนhpvนักศึกษา": ("สวัสดิการวัคซีนนักศึกษา", None),
+    "วัคซีน hpv นักศึกษา": ("สวัสดิการวัคซีนนักศึกษา", None),
+    "วัคซีนhpvสำหรับนักศึกษา": ("สวัสดิการวัคซีนนักศึกษา", None),
+    "วัคซีนฟรีนักศึกษา": ("สวัสดิการวัคซีนนักศึกษา", None),
+    "วัคซีนมะเร็งปากมดลูกฟรี": ("สวัสดิการวัคซีนนักศึกษา", None),
+    # Blood bank
     "ธนาคารเลือดและบริจาคเลือด": ("ธนาคารเลือดและบริจาคเลือด", None),
     "บริจาคเลือด": ("ธนาคารเลือดและบริจาคเลือด", None),
     "ติดต่อธนาคารเลือด": ("ธนาคารเลือดและบริจาคเลือด", None),
+    # Dental
     "หมอฟัน": ("คลินิกทันตกรรม", None),
     "ทันตกรรม": ("คลินิกทันตกรรม", None),
+    # Kidney
     "ฟอกไต": ("ศูนย์ไตเทียม", None),
+    # Gynecology
     "สูติ": ("สูตินรีเวช", None),
     "นรีเวช": ("สูตินรีเวช", None),
+    "สูตินรีเวช": ("สูตินรีเวช", None),
 }
 
 AMBIGUOUS_QUERY_CATEGORIES: dict[str, list[str]] = {
@@ -211,7 +251,7 @@ AMBIGUOUS_QUERY_CATEGORIES: dict[str, list[str]] = {
     "แพทย์": ["ตารางแพทย์และเวลาทำการ", "การจัดการนัดหมาย"],
     "คุณหมอ": ["ตารางแพทย์และเวลาทำการ", "การจัดการนัดหมาย"],
     "ศูนย์": ["ศูนย์ไตเทียม", "ตรวจสุขภาพรายบุคคล"],
-    "สิทธิ": ["ประเมินค่าใช้จ่ายทั่วไป", "ตรวจสุขภาพองค์กรและสิทธิเบิกจ่า", "ศูนย์ไตเทียม"],
+    "สิทธิ": ["ประเมินค่าใช้จ่ายทั่วไป", "ตรวจสุขภาพองค์กรและสิทธิเบิกจ่าย", "ศูนย์ไตเทียม"],
 }
 
 TYPO_CANONICAL_MAP: dict[str, str] = {
@@ -231,10 +271,17 @@ TYPO_CANONICAL_MAP: dict[str, str] = {
     "ตรวดสุขภาพ": "ตรวจสุขภาพ",
     "บริจา่คเลือด": "บริจาคเลือด",
     "บรจาค": "บริจาค",
+    # Appointment typos
+    "นัฐ": "นัด",
+    "เลื่อนนัฐ": "เลื่อนนัด",
+    "นัฐพบแพทย์": "นัดพบแพทย์",
 }
 
 EMERGENCY_RE = re.compile(r"แน่นหน้าอก|หายใจไม่ออก|หมดสติ|ชัก|ฉุกเฉิน|1669", re.IGNORECASE)
-FOLLOW_UP_RE = re.compile(r"ราคา|เท่าไหร่|เท่าไร|ติดต่อ|ที่ไหน|เปิด|วันไหน|เวลา|เข้าได้เลยไหม|เข้ามาได้เลยไหม|เข้ามาได้ไหม|มีไหม|ยังไง", re.IGNORECASE)
+FOLLOW_UP_RE = re.compile(r"ราคา|เท่าไหร่|เท่าไร|ติดต่อ|ที่ไหน|เปิด|วันไหน|เวลา|เข้าได้เลยไหม|เข้ามาได้เลยไหม|เข้ามาได้ไหม|มีไหม|ยังไง|มีรูป|ขอดูรูป|มีภาพ|ไฟล์|ลิงก์", re.IGNORECASE)
+
+# Specific image/file follow-up phrases (context-sensitive to active schedule topic)
+IMAGE_FOLLOW_UP_RE = re.compile(r"มีรูปไหม|มีภาพไหม|ขอดูรูป|มีไฟล์ไหม|มีลิงก์ไหม", re.IGNORECASE)
 BACK_RE = re.compile(r"^กลับ|ย้อนกลับ|กลับไปหมวด", re.IGNORECASE)
 SPECIFIC_AVAILABILITY_RE = re.compile(r"มีไหม|มีมั้ย|มีหรือไม่|มีรึเปล่า|มีเปล่า", re.IGNORECASE)
 QUERY_STOPWORDS = {
@@ -244,7 +291,306 @@ QUERY_STOPWORDS = {
 }
 
 
+def _is_follow_up_query(query: str) -> bool:
+    """Check if query is a follow-up question that should bind to current topic."""
+    return bool(FOLLOW_UP_RE.search(query))
+
+
+def _is_image_follow_up(query: str) -> bool:
+    """Check if query is an image/file follow-up (context-sensitive to schedule topics)."""
+    return bool(IMAGE_FOLLOW_UP_RE.search(query))
+
+
+# ── Main theme buttons (shown on reset / first open) ─────────────────────────
+MAIN_THEME_BUTTONS = [
+    "นัดหมายและตารางแพทย์",
+    "วัคซีนและบริการผู้ป่วยนอก",
+    "เวชระเบียน สิทธิ และค่าใช้จ่าย",
+    "ตรวจสุขภาพและใบรับรองแพทย์",
+    "ติดต่อหน่วยงานเฉพาะและสมัครงาน",
+]
+
+# Map displayed main-theme buttons to canonical category keys present in KB rows.
+MAIN_THEME_CANONICAL: dict[str, str] = {
+    "นัดหมายและตารางแพทย์": "นัดหมายและตารางแพทย์",
+    "วัคซีนและบริการผู้ป่วยนอก": "วัคซีน",
+    "เวชระเบียน สิทธิ และค่าใช้จ่าย": "ประเมินค่าใช้จ่ายทั่วไป",
+    "ตรวจสุขภาพและใบรับรองแพทย์": "ตรวจสุขภาพรายบุคคล",
+    "ติดต่อหน่วยงานเฉพาะและสมัครงาน": "กลุ่มงานบุคคล",
+}
+
+# Explicit child-button lists for each main theme (shown when user clicks main theme button)
+MAIN_THEME_CHILDREN: dict[str, list[str]] = {
+    "นัดหมายและตารางแพทย์": [
+        "การจัดการนัดหมาย",
+        "ตารางแพทย์และเวลาทำการ",
+        "กลับหน้าหลัก",
+    ],
+    "วัคซีนและบริการผู้ป่วยนอก": [
+        "วัคซีน HPV",
+        "วัคซีนบาดทะยัก/พิษสุนัขบ้า",
+        "วัคซีนไข้หวัดใหญ่",
+        "วัคซีนไวรัสตับอักเสบบี",
+        "กลับหน้าหลัก",
+    ],
+    "เวชระเบียน สิทธิ และค่าใช้จ่าย": [
+        "ขอประวัติการรักษา",
+        "ค่าใช้จ่ายในการรักษา",
+        "ย้ายสิทธิการรักษา / ตรวจสอบสิทธิ",
+        "กลับหน้าหลัก",
+    ],
+    "ตรวจสุขภาพและใบรับรองแพทย์": [
+        "ตรวจสุขภาพรายบุคคล",
+        "ตรวจสุขภาพองค์กรและสิทธิเบิกจ่าย",
+        "การขอเอกสารทางการแพทย์",
+        "กลับหน้าหลัก",
+    ],
+    "ติดต่อหน่วยงานเฉพาะและสมัครงาน": [
+        "ศูนย์ไตเทียม",
+        "ธนาคารเลือดและบริจาคเลือด",
+        "คลินิกทันตกรรม",
+        "กลุ่มงานบุคคล",
+        "กลับหน้าหลัก",
+    ],
+}
+
+# Map canonical category back to its parent main-theme label
+CATEGORY_TO_MAIN_THEME: dict[str, str] = {}
+for _theme, _children in MAIN_THEME_CHILDREN.items():
+    for _child in _children:
+        if _child != "กลับหน้าหลัก":
+            CATEGORY_TO_MAIN_THEME[_child] = _theme
+# Also map canonical names
+CATEGORY_TO_MAIN_THEME.update({
+    "นัดหมายและตารางแพทย์": "นัดหมายและตารางแพทย์",
+    "การจัดการนัดหมาย": "นัดหมายและตารางแพทย์",
+    "ตารางแพทย์และเวลาทำการ": "นัดหมายและตารางแพทย์",
+    "วัคซีน": "วัคซีนและบริการผู้ป่วยนอก",
+    "สวัสดิการวัคซีนนักศึกษา": "วัคซีนและบริการผู้ป่วยนอก",
+    "ประเมินค่าใช้จ่ายทั่วไป": "เวชระเบียน สิทธิ และค่าใช้จ่าย",
+    "ตรวจสุขภาพรายบุคคล": "ตรวจสุขภาพและใบรับรองแพทย์",
+    "ตรวจสุขภาพองค์กรและสิทธิเบิกจ่าย": "ตรวจสุขภาพและใบรับรองแพทย์",
+    "การขอเอกสารทางการแพทย์": "ตรวจสุขภาพและใบรับรองแพทย์",
+    "ศูนย์ไตเทียม": "ติดต่อหน่วยงานเฉพาะและสมัครงาน",
+    "ธนาคารเลือดและบริจาคเลือด": "ติดต่อหน่วยงานเฉพาะและสมัครงาน",
+    "คลินิกทันตกรรม": "ติดต่อหน่วยงานเฉพาะและสมัครงาน",
+    "กลุ่มงานบุคคล": "ติดต่อหน่วยงานเฉพาะและสมัครงาน",
+})
+
+# OPD specialty list shown when user asks broad schedule question
+SCHEDULE_SPECIALTY_MENU: list[str] = [
+    "ระบบทางเดินปัสสาวะ",
+    "ทั่วไป (GP)",
+    "อายุรกรรม",
+    "สุขภาพจิตชุมชน",
+    "เวชศาสตร์ครอบครัว",
+    "ผิวหนัง",
+    "ตรวจสุขภาพ",
+    "อายุรแพทย์ผู้สูงอายุ",
+    "อายุรแพทย์มะเร็งวิทยา",
+    "สูตินรีเวช",
+    "จักษุแพทย์ (ตา)",
+    "หู คอ จมูก",
+    "กุมารแพทย์",
+    "กุมารแพทย์ โรคหัวใจ",
+    "อายุรแพทย์โรคหัวใจ",
+    "ระบบประสาทและสมอง",
+    "ศัลยแพทย์กระดูกและข้อ",
+    "เวชศาสตร์การกีฬา",
+    "ออร์โธปิดิคส์บูรณสภาพ",
+    "กลับไปหมวดนัดหมายและตารางแพทย์",
+]
+
+SCHEDULE_DEPARTMENT_MENU: list[str] = [
+    "ผู้ป่วยนอก 1/OPD 1",
+    "ผู้ป่วยนอก 2/OPD 2",
+    "ผู้ป่วยนอก 3/OPD 3",
+    "ผู้ป่วยนอก 4/OPD 4",
+    "ศูนย์ศัลยกรรมกระดูกและข้อ",
+    "ค้นหาตามเฉพาะทาง",
+    "กลับไปหมวดนัดหมายและตารางแพทย์",
+]
+
+SCHEDULE_DEPARTMENT_SPECIALTIES: dict[str, list[str]] = {
+    "ผู้ป่วยนอก 1/OPD 1": [
+        "ระบบทางเดินปัสสาวะ",
+        "ทั่วไป (GP)",
+        "อายุรกรรม",
+        "สุขภาพจิตชุมชน",
+        "เวชศาสตร์ครอบครัว",
+        "กลับไปเลือกแผนกตารางแพทย์",
+    ],
+    "ผู้ป่วยนอก 2/OPD 2": [
+        "ผิวหนัง",
+        "ตรวจสุขภาพ",
+        "อายุรแพทย์ผู้สูงอายุ",
+        "อายุรแพทย์มะเร็งวิทยา",
+        "กลับไปเลือกแผนกตารางแพทย์",
+    ],
+    "ผู้ป่วยนอก 3/OPD 3": [
+        "สูตินรีเวช",
+        "จักษุแพทย์ (ตา)",
+        "หู คอ จมูก",
+        "กุมารแพทย์",
+        "กุมารแพทย์ โรคหัวใจ",
+        "กลับไปเลือกแผนกตารางแพทย์",
+    ],
+    "ผู้ป่วยนอก 4/OPD 4": [
+        "อายุรแพทย์โรคหัวใจ",
+        "ระบบประสาทและสมอง",
+        "กลับไปเลือกแผนกตารางแพทย์",
+    ],
+    "ศูนย์ศัลยกรรมกระดูกและข้อ": [
+        "เวชศาสตร์การกีฬา",
+        "ออร์โธปิดิคส์บูรณสภาพ",
+        "ศัลยแพทย์กระดูกและข้อ",
+        "กลับไปเลือกแผนกตารางแพทย์",
+    ],
+}
+
+CANONICAL_CATEGORY_RULES: dict[str, dict[str, Any]] = {
+    "การจัดการนัดหมาย": {
+        "raw_category": "นัดหมายและตารางแพทย์",
+        "subcategories": {"ขอเลื่อนนัดพบแพทย์", "ลืมวันนัด / เช็ควันนัด"},
+    },
+    "ตารางแพทย์และเวลาทำการ": {
+        "raw_category": "นัดหมายและตารางแพทย์",
+        "subcategories": {"ตารางแพทย์ออกตรวจ", "เวลาทำการแผนกผู้ป่วยนอก"},
+    },
+    "วัคซีน": {"raw_category": "วัคซีนและบริการผู้ป่วยนอก"},
+    "สวัสดิการวัคซีนนักศึกษา": {"raw_category": "วัคซีนและบริการผู้ป่วยนอก"},
+    "ตรวจสุขภาพรายบุคคล": {
+        "raw_category": "ตรวจสุขภาพและใบรับรองแพทย์",
+        "subcategories": {"โปรแกรมตรวจสุขภาพ", "เวลาตรวจสุขภาพ"},
+    },
+    "ตรวจสุขภาพองค์กรและสิทธิเบิกจ่าย": {
+        "raw_category": "ตรวจสุขภาพและใบรับรองแพทย์",
+        "subcategories": {"ตรวจสุขภาพหมู่คณะ / หน่วยงาน", "ใช้สิทธิเบิกตรงตรวจสุขภาพได้ไหม"},
+    },
+    "การขอเอกสารทางการแพทย์": {
+        "raw_category": "ตรวจสุขภาพและใบรับรองแพทย์",
+        "subcategories": {"ขอใบรับรองแพทย์"},
+    },
+    "ประเมินค่าใช้จ่ายทั่วไป": {"raw_category": "เวชระเบียน สิทธิ และค่าใช้จ่าย"},
+    "ศูนย์ไตเทียม": {
+        "raw_category": "ติดต่อหน่วยงานเฉพาะและสมัครงาน",
+        "subcategories": {"หน่วยไตเทียม"},
+    },
+    "ธนาคารเลือดและบริจาคเลือด": {
+        "raw_category": "ติดต่อหน่วยงานเฉพาะและสมัครงาน",
+        "subcategories": {"ธนาคารเลือด / บริจาคเลือด"},
+    },
+    "คลินิกทันตกรรม": {
+        "raw_category": "ติดต่อหน่วยงานเฉพาะและสมัครงาน",
+        "subcategories": {"โรงพยาบาลทันตกรรม"},
+    },
+    "กลุ่มงานบุคคล": {
+        "raw_category": "ติดต่อหน่วยงานเฉพาะและสมัครงาน",
+        "subcategories": {"สมัครงาน / งานบุคคล"},
+    },
+}
+
+RUNTIME_QUERY_REPLACEMENTS: dict[str, str] = {
+    "opd1": "opd 1",
+    "opd2": "opd 2",
+    "opd3": "opd 3",
+    "opd4": "opd 4",
+    "check up": "ตรวจสุขภาพ",
+    "check-up": "ตรวจสุขภาพ",
+    "ent": "หูคอจมูก",
+    "วักซีน": "วัคซีน",
+    "วัปซีน": "วัคซีน",
+    "วคซีน": "วัคซีน",
+    "หมอหนัง": "หมอผิวหนังวันไหน",
+    "หมอกระดุก": "หมอกระดูก",
+    "ตรจสุขภาพ": "ตรวจสุขภาพ",
+    "ลืมนัด": "ลืมวันนัด",
+    "เชคนัด": "เช็ควันนัด",
+    "เช็คสิทธิ": "ย้ายสิทธิการรักษา ตรวจสอบสิทธิ",
+    "นัดหมอ": "นัดพบแพทย์",
+    "ตารางหมอ": "ตารางแพทย์ออกตรวจ",
+    "หมอฟัน": "ทันตกรรม",
+    "หมอทันตกรรม": "ทันตกรรม",
+    "ทำฟัน": "ทันตกรรม",
+    "ฟอกไต": "ไตเทียม",
+    "หมอเด็ก": "กุมารแพทย์",
+    "หมอตา": "จักษุแพทย์",
+    "สูตินรีเวช": "สูติ นรีเวช",
+    "วัคซีนตับบี": "วัคซีนไวรัสตับอักเสบบี",
+    "วัคซีนบาดทะยัก": "วัคซีนบาดทะยัก พิษสุนัขบ้า",
+    "วัคซีนพิษสุนัขบ้า": "วัคซีนบาดทะยัก พิษสุนัขบ้า",
+    "วัคซีน hpv": "วัคซีนมะเร็งปากมดลูก",
+    "วัคซีนมะเร็งปากมดลูก": "วัคซีนมะเร็งปากมดลูก",
+    "วัคซีนไข้หวัดใหญ่": "วัคซีนไข้หวัดใหญ่",
+    "วัคซีนอินฟลูเอนซา": "วัคซีนไข้หวัดใหญ่",
+    "ตรวจสุขภาพ": "โปรแกรมตรวจสุขภาพ",
+    "ตรวจร่างกาย": "โปรแกรมตรวจสุขภาพ",
+    "ตรวจสุขภาพบริษัท": "ตรวจสุขภาพหมู่คณะ หน่วยงาน",
+    "ตรวจสุขภาพพนักงาน": "ตรวจสุขภาพหมู่คณะ หน่วยงาน",
+    "ตรวจสุขภาพหมู่คณะ": "ตรวจสุขภาพเป็นหมู่คณะหรือหน่วยงานราชการ",
+    "ตรวจสุขภาพบริษัท": "ตรวจสุขภาพเป็นหมู่คณะหรือหน่วยงานราชการ",
+    "ตรวจสุขภาพพนักงาน": "ตรวจสุขภาพเป็นหมู่คณะหรือหน่วยงานราชการ",
+    "ใช้สิทธิเบิกตรงได้ไหม": "ใช้สิทธิเบิกตรงตรวจสุขภาพได้ไหม",
+    "ใบรับรองแพทย์": "ขอใบรับรองแพทย์",
+    "ใบรับรอง": "ขอใบรับรองแพทย์",
+    "ใบขับขี่": "ใบรับรองแพทย์ ทำใบขับขี่",
+    "ราคาเท่าไร": "ราคาเท่าไหร่",
+    "สิทธิการรักษา": "ย้ายสิทธิการรักษาหรือตรวจสอบสิทธิการรักษา",
+    "เวชระเบียน": "ขอประวัติการรักษา",
+    "ค่ารักษา": "ค่าใช้จ่ายในการรักษา",
+    "ค่าใช้จ่าย": "ค่าใช้จ่ายในการรักษา",
+    "ติดต่อการเงิน": "ค่าใช้จ่ายในการรักษา",
+    "ตรวจตาราคาเท่าไหร่": "ค่าใช้จ่ายในการรักษา ตรวจตาราคาเท่าไหร่",
+    "ศูนย์ไตเทียม": "หน่วยไตเทียม",
+    "ไตเทียม": "หน่วยไตเทียม",
+    "ฟอกไต": "ที่โรงพยาบาลมีบริการฟอกไตไหม หากต้องการฟอกไตที่โรงพยาบาลมหาวิทยาลัยพะเยา ต้องทำอย่างไร",
+    "ใช้สิทธิฟอกไตได้ไหม": "สามารถใช้สิทธิการรักษาอะไรได้บ้าง หรือมีค่าใช้จ่ายส่วนเกินไหม",
+    "ฟอกไตใช้สิทธิไรได้บ้าง": "สามารถใช้สิทธิการรักษาอะไรได้บ้าง หรือมีค่าใช้จ่ายส่วนเกินไหม",
+    "สมัครงานต้องใช้ใบรับรองไหม": "ใบรับรองแพทย์สมัครงาน",
+    "มีวัคซีนสำหรับนักศึกษาไหม": "วัคซีนมะเร็งปากมดลูกฟรีมีไหม กรณีนิสิตอายุไม่เกิน 20 ปี",
+    "วัคซีนสำหรับนักศึกษา": "วัคซีนมะเร็งปากมดลูกฟรีมีไหม กรณีนิสิตอายุไม่เกิน 20 ปี",
+    "วัคซีนนักศึกษา": "วัคซีนมะเร็งปากมดลูกฟรีมีไหม กรณีนิสิตอายุไม่เกิน 20 ปี",
+    "ให้เลือดวันไหน": "บริจาคเลือดวันไหนได้บ้าง สามารถเข้ามาได้วันไหน",
+    "บริจาคเลือด": "ติดต่อธนาคารเลือด/บริจาคเลือด",
+    "ธนาคารเลือด": "ติดต่อธนาคารเลือด/บริจาคเลือด",
+    "หมอฟัน": "ติดต่อโรงพยาบาลทันตกรรม สอบถามเกี่ยวกับช่องปากหรือฟัน",
+    "ทันตกรรม": "ติดต่อโรงพยาบาลทันตกรรม สอบถามเกี่ยวกับช่องปากหรือฟัน",
+    "ทำฟัน": "ติดต่อโรงพยาบาลทันตกรรม สอบถามเกี่ยวกับช่องปากหรือฟัน",
+    "สมัครงาน": "เกี่ยวกับการสมัครงาน",
+    "งานบุคคล": "เกี่ยวกับการสมัครงาน",
+    "มีรับสมัครงานไหม": "เกี่ยวกับการสมัครงาน",
+    "ent วันไหน": "ตารางแพทย์ หูคอจมูก",
+    "opd 1 เปิดกี่โมง": "ตารางแพทย์ ทั่วไป opd 1",
+    "opd 2 มีหมอผิวหนังไหม": "ตารางแพทย์ ผิวหนัง opd 2",
+}
+
+FOLLOWUP_SLOT_PATTERNS: dict[str, re.Pattern[str]] = {
+    "price": re.compile(r"ราคา|ค่าใช้จ่าย|กี่บาท|เท่าไหร่|เท่าไร", re.IGNORECASE),
+    "contact": re.compile(r"ติดต่อ|โทร|เบอร์|ที่ไหน|line|ไลน์", re.IGNORECASE),
+    "hours": re.compile(r"เปิด|วันไหน|เวลา|กี่โมง|วันทำการ", re.IGNORECASE),
+    "walkin": re.compile(r"เข้าได้เลย|walk ?in|walk-in|ต้องนัด|ใช้สิทธิ|สำรองจ่าย|ต้องทำหนังสือ", re.IGNORECASE),
+    "link": re.compile(r"ลิงก์|link|เว็บไซต์|facebook|เพจ", re.IGNORECASE),
+    "image": re.compile(r"รูป|ภาพ|ไฟล์แนบ|ตาราง|มีรูปไหม", re.IGNORECASE),
+}
+
+SCHEDULE_QUERY_RE = re.compile(r"ตารางแพทย์|ตารางหมอ|แพทย์ออกตรวจ|หมอ.*วันไหน|ออกตรวจ|หมอ.+มีไหม|คลินิก.+วันไหน", re.IGNORECASE)
+
 # ── Session memory ────────────────────────────────────────────────────────────
+SCHEDULE_SPECIALTY_ALIASES: dict[str, list[str]] = {
+    "จักษุแพทย์ (ตา)": ["หมอตา", "จักษุแพทย์", "ตา"],
+    "อายุรแพทย์โรคผิวหนัง (ผิวหนัง)": ["หมอผิวหนัง", "หมอหนัง", "ผิวหนัง"],
+    "ศัลยแพทย์กระดูกและข้อ": ["หมอกระดูก", "หมอกระดุก", "กระดูก", "กระดูกและข้อ"],
+    "กุมารแพทย์": ["กุมารแพทย์", "หมอเด็ก", "เด็ก"],
+    "กุมารแพทย์ โรคหัวใจ": ["กุมารแพทย์ โรคหัวใจ"],
+    "แพทย์สูติศาสตร์และนรีเวช ฯ (สูตินรีเวช)": ["สูตินรีเวช", "สูติ", "นรีเวช", "สูติและนรีเวช"],
+    "อายุรกรรม (med)": ["อายุรกรรม", "med"],
+    "หู คอ จมูก": ["ent", "หูคอจมูก", "หู คอ จมูก"],
+    "ผู้ป่วยนอก 1/opd 1": ["opd 1", "opd1", "ผู้ป่วยนอก 1"],
+    "ผู้ป่วยนอก 2/opd 2": ["opd 2", "opd2", "ผู้ป่วยนอก 2"],
+    "ผู้ป่วยนอก 3/opd 3": ["opd 3", "opd3", "ผู้ป่วยนอก 3"],
+    "ผู้ป่วยนอก 4/opd 4": ["opd 4", "opd4", "ผู้ป่วยนอก 4"],
+}
+
 @dataclass(slots=True)
 class SessionMemory:
     session_id: str
@@ -252,10 +598,30 @@ class SessionMemory:
     last_topic_id: str | None = None
     last_topic_question: str | None = None
     last_buttons: list[str] = field(default_factory=list)
+    fallback_count: int = 0
     touched_at: float = field(default_factory=time.time)
+    last_reset_at: float | None = None
 
     def touch(self) -> None:
         self.touched_at = time.time()
+
+    def reset_context(self, auto: bool = False) -> None:
+        """Clear category/topic context for fallback recovery.
+        
+        Args:
+            auto: If True, this is an automatic reset (e.g., fallback recovery).
+                  If False, this is an explicit reset (e.g., user goHome action).
+        """
+        self.last_category = None
+        self.last_topic_id = None
+        self.last_topic_question = None
+        self.last_buttons = []
+        self.fallback_count = 0
+        # Only set last_reset_at for auto-resets, not for explicit resets
+        if auto:
+            self.last_reset_at = time.time()
+        else:
+            self.last_reset_at = None
 
 
 # ── App state ─────────────────────────────────────────────────────────────────
@@ -303,15 +669,6 @@ class AppState:
 
 
 state = AppState()
-try:
-    logger.info("⏳ Loading retriever and knowledge base…")
-    state.reload_retriever()
-    logger.info("✅ Retriever ready. %d records loaded.", len(state.records))
-except Exception as exc:
-    logger.warning("⚠️  Retriever failed to load (will run in KB-only mode): %s", exc)
-    state.retriever = None
-    state.rebuild_catalog()
-    logger.info("📚 KB-only mode. %d records loaded from JSONL.", len(state.records))
 
 
 # ── Text normalization helpers ─────────────────────────────────────────────────
@@ -342,6 +699,8 @@ def _normalize_typo(query: str) -> tuple[str, str | None]:
         for k, v in TYPO_CANONICAL_MAP.items():
             if compact == k.replace(" ", ""):
                 return v, k
+    if q in {_normalize(v) for v in TYPO_CANONICAL_MAP.values()} or compact in {_compact_normalize(v) for v in TYPO_CANONICAL_MAP.values()}:
+        return query, None
     best = None
     best_score = 0.0
     for wrong, right in TYPO_CANONICAL_MAP.items():
@@ -355,6 +714,15 @@ def _normalize_typo(query: str) -> tuple[str, str | None]:
 
 
 def _looks_like_query_plus_noise(query: str) -> str:
+    normalized_query = _normalize(query)
+    if _is_schedule_query(query):
+        return query
+    if any(token in normalized_query for token in ("opd 1", "opd 2", "opd 3", "opd 4", "ent", "ตารางแพทย์", "ตารางหมอ")):
+        return query
+    if any(token in normalized_query for token in ("หมอฟัน", "ทันตกรรม", "หมอทันตกรรม")) and any(
+        marker in normalized_query for marker in ("วันไหน", "วันนี้", "มีไหม", "เปิด", "เวลา")
+    ):
+        return query
     tokens = _meaningful_tokens(query)
     if not tokens:
         return query
@@ -407,6 +775,67 @@ def _meaningful_tokens(text: str) -> list[str]:
     return out
 
 
+QUERY_WRAPPER_PREFIXES = (
+    "ขอสอบถาม",
+    "อยากทราบ",
+    "รบกวนสอบถาม",
+    "ช่วยเช็กให้หน่อย",
+    "ช่วยเช็คให้หน่อย",
+    "ขอข้อมูล",
+    "สอบถาม",
+)
+
+QUERY_POLITE_SUFFIXES = (
+    "ครับ",
+    "ค่ะ",
+    "คะ",
+    "หน่อย",
+)
+
+
+def _strip_runtime_wrappers(text: str) -> str:
+    current = str(text or "").strip()
+    if not current:
+        return current
+    while True:
+        updated = current
+        for prefix in QUERY_WRAPPER_PREFIXES:
+            if updated.startswith(prefix):
+                updated = updated[len(prefix):].strip()
+        for suffix in QUERY_POLITE_SUFFIXES:
+            if updated.endswith(suffix):
+                updated = updated[: -len(suffix)].strip()
+        if updated == current:
+            break
+        current = updated
+    return current
+
+
+def _menu_query_forms(text: str) -> list[str]:
+    stripped = _strip_runtime_wrappers(text)
+    forms = [str(text or "").strip(), stripped]
+    extra_forms: list[str] = []
+    for form in forms:
+        cleaned = form.strip()
+        if cleaned.endswith("ได้ไหม"):
+            extra_forms.append(cleaned[: -len("ได้ไหม")].strip())
+        if cleaned.endswith("ไหม"):
+            extra_forms.append(cleaned[: -len("ไหม")].strip())
+    out: list[str] = []
+    for form in [*forms, *extra_forms]:
+        if form and form not in out:
+            out.append(form)
+    return out
+
+
+def _extract_menu_navigation_label(text: str) -> str | None:
+    for form in _menu_query_forms(text):
+        for label in MAIN_THEME_BUTTONS:
+            if _looks_like_menu_label(form, label):
+                return label
+    return None
+
+
 def _record_to_candidate(row: dict[str, Any], score: float, *, source: str = "catalog") -> RetrievalCandidate:
     return RetrievalCandidate(
         id=str(row.get("id") or ""),
@@ -426,6 +855,398 @@ def _record_to_candidate(row: dict[str, Any], score: float, *, source: str = "ca
         stale=False,
         metadata=row,
     )
+
+
+def _record_type(row: dict[str, Any] | RetrievalCandidate | None) -> str:
+    if row is None:
+        return ""
+    if isinstance(row, RetrievalCandidate):
+        row = row.metadata or {}
+    return str(row.get("record_type") or "").strip()
+
+
+def _parse_list_field(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(v).strip() for v in parsed if str(v).strip()]
+        except Exception:
+            pass
+    parts = re.split(r"\s*\|\s*|\n+", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _rewrite_runtime_query(query: str) -> str:
+    text = str(query or "").strip()
+    if not text:
+        return text
+    rewritten = re.sub(r"\s+", " ", text.lower())
+    exact_replacements = {
+        wrong.lower(): right.lower()
+        for wrong, right in RUNTIME_QUERY_REPLACEMENTS.items()
+        if " " not in wrong.strip() and len(wrong.strip()) <= 18
+    }
+    if rewritten in exact_replacements:
+        return exact_replacements[rewritten]
+    for wrong, right in RUNTIME_QUERY_REPLACEMENTS.items():
+        wrong_l = wrong.lower()
+        right_l = right.lower()
+        if rewritten == wrong_l:
+            rewritten = right_l
+            continue
+        if len(wrong_l) >= 8 and wrong_l in rewritten:
+            rewritten = rewritten.replace(wrong_l, right_l)
+    return rewritten.strip()
+
+
+def _category_rule(category: str | None) -> dict[str, Any] | None:
+    if not category:
+        return None
+    return CANONICAL_CATEGORY_RULES.get(str(category).strip())
+
+
+def _row_matches_category_scope(row: dict[str, Any], category: str | None) -> bool:
+    if not category:
+        return True
+    rule = _category_rule(category)
+    row_category = str(row.get("category") or "").strip()
+    row_subcategory = str(row.get("subcategory") or "").strip()
+    if rule is None:
+        return row_category == category
+    if row_category != str(rule.get("raw_category") or "").strip():
+        return False
+    allowed_subcategories = set(rule.get("subcategories") or [])
+    if not allowed_subcategories:
+        return True
+    return row_subcategory in allowed_subcategories or str(row.get("record_type") or "").strip() == "menu_node"
+
+
+def _rows_for_category_scope(category: str | None) -> list[dict[str, Any]]:
+    return [row for row in _active_rows() if _row_matches_category_scope(row, category)]
+
+
+def _canonical_category_from_values(raw_category: str | None, subcategory: str | None, query: str = "") -> str | None:
+    raw = str(raw_category or "").strip()
+    sub = str(subcategory or "").strip()
+    q = _normalize(query)
+
+    for label, canonical in MAIN_THEME_CANONICAL.items():
+        if raw == label and label != "นัดหมายและตารางแพทย์":
+            return canonical
+
+    if _is_schedule_query(query) and q != "นัดหมายและตารางแพทย์":
+        return "ตารางแพทย์และเวลาทำการ"
+
+    if raw == "นัดหมายและตารางแพทย์":
+        if q == "นัดหมายและตารางแพทย์" and not sub:
+            return "นัดหมายและตารางแพทย์"
+        if sub in {"ตารางแพทย์ออกตรวจ", "เวลาทำการแผนกผู้ป่วยนอก"}:
+            return "ตารางแพทย์และเวลาทำการ"
+        return "การจัดการนัดหมาย"
+
+    if raw == "วัคซีนและบริการผู้ป่วยนอก":
+        if any(token in q for token in ("นักศึกษา",)):
+            return "สวัสดิการวัคซีนนักศึกษา"
+        return "วัคซีน"
+
+    if raw == "ตรวจสุขภาพและใบรับรองแพทย์":
+        if sub == "ขอใบรับรองแพทย์" or any(token in q for token in ("ใบรับรอง", "ใบขับขี่")):
+            return "การขอเอกสารทางการแพทย์"
+        if sub in {"ตรวจสุขภาพหมู่คณะ / หน่วยงาน", "ใช้สิทธิเบิกตรงตรวจสุขภาพได้ไหม"} or any(token in q for token in ("บริษัท", "หมู่คณะ", "พนักงาน", "หน่วยงาน", "เบิกตรง")):
+            return "ตรวจสุขภาพองค์กรและสิทธิเบิกจ่าย"
+        return "ตรวจสุขภาพรายบุคคล"
+
+    if raw == "เวชระเบียน สิทธิ และค่าใช้จ่าย":
+        return "ประเมินค่าใช้จ่ายทั่วไป"
+
+    if raw == "ติดต่อหน่วยงานเฉพาะและสมัครงาน":
+        if sub == "หน่วยไตเทียม" or any(token in q for token in ("ไต", "ฟอกไต")):
+            return "ศูนย์ไตเทียม"
+        if sub == "ธนาคารเลือด / บริจาคเลือด" or any(token in q for token in ("เลือด", "บริจาค")):
+            return "ธนาคารเลือดและบริจาคเลือด"
+        if sub == "โรงพยาบาลทันตกรรม" or any(token in q for token in ("ฟัน", "ทันต")):
+            return "คลินิกทันตกรรม"
+        if sub == "สมัครงาน / งานบุคคล" or any(token in q for token in ("สมัครงาน", "บุคคล")):
+            return "กลุ่มงานบุคคล"
+        if "ใบรับรอง" in q:
+            return "การขอเอกสารทางการแพทย์"
+        return "กลุ่มงานบุคคล"
+
+    for label, canonical in MAIN_THEME_CANONICAL.items():
+        if raw == label:
+            return canonical
+    return raw or None
+
+
+def _canonical_category_for_candidate(candidate: RetrievalCandidate | None, query: str = "") -> str | None:
+    if candidate is None:
+        return _canonical_category_from_values(None, None, query)
+    meta = candidate.metadata or {}
+    return _canonical_category_from_values(
+        str(meta.get("category") or candidate.category or "").strip(),
+        str(meta.get("subcategory") or candidate.subcategory or "").strip(),
+        query,
+    )
+
+
+def _resolved_response_category(candidate: RetrievalCandidate | None, query: str = "", category_hint: str | None = None) -> str | None:
+    q = _normalize(query)
+    if candidate is not None and str(candidate.id or "") == "qa-0021":
+        return "ศูนย์ไตเทียม"
+    if "วัคซีน" in q and any(token in q for token in ("นักศึกษา", "นิสิต")):
+        return "สวัสดิการวัคซีนนักศึกษา"
+    if "วัคซีนมะเร็งปากมดลูกฟรี" in q and not any(token in q for token in ("นักศึกษา", "นิสิต")):
+        return "วัคซีน"
+    if any(token in q for token in ("ฟอกไต", "ไตเทียม", "ล้างไต")):
+        return "ศูนย์ไตเทียม"
+    if "สมัครงาน" in q and "ใบรับรอง" in q:
+        return "การขอเอกสารทางการแพทย์"
+    if any(token in q for token in ("ใบรับรอง", "ใบขับขี่")):
+        return "การขอเอกสารทางการแพทย์"
+    if any(token in q for token in ("ตรวจร่างกาย", "ตรวจสุขภาพ", "โปรแกรมตรวจสุขภาพ", "check up", "check-up")) and not any(
+        token in q for token in ("บริษัท", "หมู่คณะ", "หน่วยงาน", "พนักงาน", "เบิกตรง")
+    ):
+        return "ตรวจสุขภาพรายบุคคล"
+    if "หมอหนัง" in q or q in {"หมอผิวหนัง", "ผิวหนัง"}:
+        return "ตารางแพทย์และเวลาทำการ"
+    canonical = _canonical_category_for_candidate(candidate, query)
+    if candidate is None:
+        return canonical or category_hint
+    raw_category = str(candidate.category or "").strip()
+    if category_hint and raw_category in MAIN_THEME_CANONICAL and category_hint != MAIN_THEME_CANONICAL.get(raw_category, raw_category):
+        return category_hint
+    return canonical or category_hint or raw_category or None
+
+
+def _active_rows(*, category: str | None = None, subcategory: str | None = None, record_type: str | None = None) -> list[dict[str, Any]]:
+    rows = [r for r in state.records if str(r.get("status") or "active") == "active"]
+    if category is not None:
+        rows = [r for r in rows if str(r.get("category") or "").strip() == category]
+    if subcategory is not None:
+        rows = [r for r in rows if str(r.get("subcategory") or "").strip() == subcategory]
+    if record_type is not None:
+        rows = [r for r in rows if str(r.get("record_type") or "").strip() == record_type]
+    return rows
+
+
+def _unique_category_children(category: str) -> list[str]:
+    children: list[str] = []
+    for row in _rows_for_category_scope(category):
+        if _record_type(row) in {"menu_node"}:
+            continue
+        child = str(row.get("subcategory") or "").strip()
+        if child and child not in children:
+            children.append(child)
+    return children
+
+
+def _child_topic_leaf_rows(category: str, child_topic: str) -> list[dict[str, Any]]:
+    rows = [
+        r for r in _rows_for_category_scope(category)
+        if str(r.get("subcategory") or "").strip() == child_topic
+        if _record_type(r) in {"faq_leaf", "guidance", "schedule_specific"}
+    ]
+    rows.sort(key=lambda r: (-float(r.get("source_priority") or 0), str(r.get("question") or "")))
+    return rows
+
+
+def _looks_like_exact(text: str, target: str) -> bool:
+    q = _compact_normalize(text)
+    t = _compact_normalize(target)
+    return bool(q and t and (q == t or q in t or t in q))
+
+
+def _looks_like_menu_label(text: str, target: str) -> bool:
+    q = _compact_normalize(text)
+    t = _compact_normalize(target)
+    return bool(q and t and q == t)
+
+
+def _detect_followup_slot(query: str) -> str | None:
+    for slot, pattern in FOLLOWUP_SLOT_PATTERNS.items():
+        if pattern.search(query):
+            return slot
+    return None
+
+
+def _extract_slot_from_text(text: str, slot: str) -> str:
+    if slot == "price":
+        matches = re.findall(r"[^.\n]*\d[\d,]*(?:\.\d+)?\s*บาท[^.\n]*", text)
+        return "\n".join([m.strip() for m in matches if m.strip()])
+    if slot == "contact":
+        matches = re.findall(r"(?:0\d[\d\s-]{6,}\d)(?:\s*ต่อ\s*\d+)?", text)
+        return "\n".join([m.strip() for m in matches if m.strip()])
+    if slot == "hours":
+        matches = re.findall(r"(?:วัน[^\n]*?|ทุกวัน[^\n]*?)(?:\d{1,2}[.:]\d{2}\s*-\s*\d{1,2}[.:]\d{2}\s*น\.?|หยุด[^\n]*)", text)
+        return "\n".join([m.strip() for m in matches if m.strip()])
+    if slot == "link":
+        matches = re.findall(r"https?://[^\s)>\]]+", text)
+        return "\n".join([m.strip() for m in matches if m.strip()])
+    return ""
+
+
+def _slot_value(topic: RetrievalCandidate, slot: str) -> str:
+    meta = topic.metadata or {}
+    if slot == "image":
+        return "\n".join(_parse_list_field(meta.get("followup_image_paths")))
+    value = str(meta.get(f"followup_{slot}") or "").strip()
+    if value:
+        return value
+    fallback_text = "\n".join([str(meta.get("answer") or topic.answer or ""), str(meta.get("note") or meta.get("notes") or topic.notes or "")])
+    return _extract_slot_from_text(fallback_text, slot)
+
+
+def _build_followup_slot_answer(topic: RetrievalCandidate, query: str) -> str | None:
+    slot = _detect_followup_slot(query)
+    if not slot:
+        return None
+    value = _slot_value(topic, slot)
+    if value:
+        labels = {
+            "price": "ราคา",
+            "contact": "ติดต่อ",
+            "hours": "วันและเวลา",
+            "walkin": "เงื่อนไขการเข้ารับบริการ",
+            "link": "ลิงก์",
+            "image": "ไฟล์แนบ",
+        }
+        return f"{labels.get(slot, slot)}: {value}"
+    contact = _slot_value(topic, "contact")
+    if contact:
+        return f"ยังไม่มีรายละเอียดเฉพาะเรื่องนี้ในระบบค่ะ แนะนำติดต่อหน่วยงานที่เกี่ยวข้อง: {contact}"
+    return "ยังไม่มีรายละเอียดเฉพาะเรื่องนี้ในระบบค่ะ"
+
+
+def _is_schedule_query(query: str) -> bool:
+    if SCHEDULE_QUERY_RE.search(query):
+        return True
+    compact = _compact_normalize(query)
+    if not compact:
+        return False
+    direct_markers = [
+        "ตารางแพทย์",
+        "ตารางหมอ",
+        "หมอกระดูก",
+        "หมอผิวหนัง",
+        "หมอตา",
+        "สูตินรีเวช",
+        "กุมารแพทย์",
+        "หมอเด็ก",
+        "ent",
+        "อายุรกรรม",
+        "ทันตกรรม",
+        "หมอฟัน",
+        "หมอทันตกรรม",
+        "opd1",
+        "opd2",
+        "opd3",
+        "opd4",
+    ]
+    intent_markers = ["วันไหน", "วันนี้", "มีไหม", "เปิด", "เวลา", "ออกตรวจ", "ตาราง"]
+    if any(_compact_normalize(marker) in compact for marker in direct_markers) and any(marker in query for marker in intent_markers):
+        return True
+    for aliases in SCHEDULE_SPECIALTY_ALIASES.values():
+        for alias in aliases:
+            alias_compact = _compact_normalize(alias)
+            if alias_compact and alias_compact in compact:
+                if "วันไหน" in query or "วันนี้" in query or "มีไหม" in query or "เปิด" in query or "เวลา" in query:
+                    return True
+    return False
+
+
+def _schedule_rows() -> list[dict[str, Any]]:
+    return _active_rows(category="นัดหมายและตารางแพทย์", subcategory="ตารางแพทย์ออกตรวจ", record_type="schedule_specific")
+
+
+def _match_schedule_record(query: str) -> RetrievalCandidate | None:
+    qn = _normalize(query)
+    qc = _compact_normalize(query)
+    requested_specialties: set[str] = set()
+    requested_clinics: set[str] = set()
+    for key, values in SCHEDULE_SPECIALTY_ALIASES.items():
+        for alias in values:
+            alias_compact = _compact_normalize(alias)
+            if alias_compact and alias_compact in qc:
+                requested_specialties.add(key)
+    for clinic_alias in ("ผู้ป่วยนอก 1/OPD 1", "ผู้ป่วยนอก 2/OPD 2", "ผู้ป่วยนอก 3/OPD 3", "ผู้ป่วยนอก 4/OPD 4"):
+        clinic_alias_compact = _compact_normalize(clinic_alias)
+        if clinic_alias_compact and clinic_alias_compact in qc:
+            requested_clinics.add(clinic_alias)
+    best: tuple[dict[str, Any] | None, float] = (None, 0.0)
+    for row in _schedule_rows():
+        specialty = str(row.get("topic") or row.get("specialty") or "").strip()
+        aliases = _parse_list_field(row.get("aliases"))
+        clinic = str(row.get("clinic") or row.get("department") or "").strip()
+        keywords = [str(k).strip() for k in (row.get("keywords") or []) if str(k).strip()]
+        runtime_aliases: list[str] = []
+        row_specialties: set[str] = set()
+        specialty_compact = _compact_normalize(specialty)
+        clinic_compact = _compact_normalize(clinic)
+        question_compact = _compact_normalize(str(row.get("question") or ""))
+        for key, values in SCHEDULE_SPECIALTY_ALIASES.items():
+            key_compact = _compact_normalize(key)
+            if key_compact and (
+                key_compact == specialty_compact
+                or key_compact == clinic_compact
+                or key_compact == question_compact
+                or key_compact in specialty_compact
+                or specialty_compact in key_compact
+                or key_compact in question_compact
+            ):
+                row_specialties.add(key)
+                runtime_aliases.extend(values)
+        if requested_specialties and not (requested_specialties & row_specialties):
+            continue
+        if requested_clinics:
+            clinic_match = False
+            for clinic_alias in requested_clinics:
+                clinic_alias_compact = _compact_normalize(clinic_alias)
+                if clinic_alias_compact and (
+                    clinic_alias_compact == clinic_compact
+                    or clinic_alias_compact in clinic_compact
+                    or clinic_compact in clinic_alias_compact
+                    or clinic_alias_compact in question_compact
+                ):
+                    clinic_match = True
+                    break
+            if not clinic_match:
+                continue
+        for option in [specialty, clinic, row.get("question", ""), row.get("note", ""), *aliases, *keywords, *runtime_aliases]:
+            opt = str(option or "").strip()
+            if not opt:
+                continue
+            on = _normalize(opt)
+            oc = _compact_normalize(opt)
+            if qc and oc and len(oc) >= 3 and oc in qc:
+                score = 0.99
+                if score > best[1]:
+                    best = (row, score)
+                continue
+            score = max(
+                SequenceMatcher(None, qn, on).ratio(),
+                SequenceMatcher(None, qc, oc).ratio(),
+            )
+            if qc and (qc in oc or oc in qc):
+                score = max(score, 0.96 if len(oc) >= 3 else score)
+            if qc and len(qc) >= 4 and len(oc) >= 4:
+                query_parts = re.findall(r"[ก-๙a-z0-9]{4,}", qc)
+                if any(part in oc for part in query_parts):
+                    score = max(score, 0.88)
+            option_tokens = {tok for tok in _meaningful_tokens(opt) if len(tok) >= 2}
+            query_tokens = {tok for tok in _meaningful_tokens(query) if len(tok) >= 2}
+            if option_tokens and query_tokens and (option_tokens & query_tokens):
+                score = max(score, 0.90)
+            if score > best[1]:
+                best = (row, score)
+    if best[0] is not None and best[1] >= 0.62:
+        return _record_to_candidate(best[0], best[1], source="schedule")
+    return None
 
 
 def _topic_alias_candidates(query: str) -> list[RetrievalCandidate]:
@@ -480,9 +1301,12 @@ def _is_probably_gibberish(query: str, *, matched: bool = False, best_candidate:
     if best_candidate is not None and best_candidate.final_score >= 0.58:
         return False
     compact = _compact_normalize(query)
+    meaningful = _meaningful_tokens(query)
     if not compact:
         return True
     if compact in TYPO_CANONICAL_MAP or query in TYPO_CANONICAL_MAP:
+        return False
+    if len(compact) >= 8 and len(meaningful) >= 2:
         return False
     if len(compact) <= 2:
         return True
@@ -524,15 +1348,13 @@ def _catalog_match_score(query: str, row: dict[str, Any], category_hint: str | N
         sim_full * 0.35 + sim_compact * 0.25 + sim_thai * 0.15 + token_overlap * 0.15 + keyword_overlap * 0.10,
         sim_compact * 0.55 + token_overlap * 0.25 + keyword_overlap * 0.20,
     )
-    if category_hint and str(row.get("category") or "") == category_hint:
+    if category_hint and _row_matches_category_scope(row, category_hint):
         score += 0.03
     return min(1.0, round(score, 6))
 
 
 def _catalog_search(query: str, *, category: str | None = None, limit: int = 8) -> list[RetrievalCandidate]:
-    rows = state.records
-    if category:
-        rows = [r for r in rows if str(r.get("category") or "") == category]
+    rows = _rows_for_category_scope(category) if category else state.records
     scored: list[RetrievalCandidate] = []
     for row in rows:
         if str(row.get("status") or "active") != "active":
@@ -555,84 +1377,8 @@ def _merge_candidates(*candidate_lists: list[RetrievalCandidate], limit: int = 1
     return out[:limit]
 
 
-def _has_specific_match(query: str, candidate: RetrievalCandidate | None) -> bool:
-    if candidate is None:
-        return False
-    q = _compact_normalize(query)
-    cq = _compact_normalize(candidate.question)
-    if not q or not cq:
-        return False
-    if q == cq:
-        return True
-    if len(q) >= 8 and q in cq:
-        return True
-    return candidate.final_score >= 0.82
-
-
-def _detect_preferred_category(query: str) -> tuple[str | None, str | None, float]:
-    q = query.strip()
-    if not q:
-        return None, None, 0.0
-    normalized_query, typo_source = _normalize_typo(_looks_like_query_plus_noise(q))
-    normalized = _normalize(normalized_query)
-    compact = _compact_normalize(normalized_query)
-
-    for override, (category, _) in TOPIC_ALIAS_OVERRIDES.items():
-        ov = _compact_normalize(override)
-        if ov == compact:
-            return category, override, 1.0
-
-    if normalized in AMBIGUOUS_QUERY_CATEGORIES:
-        return None, normalized, 0.0
-
-    exact_hits: list[tuple[str, str]] = []
-    for category, aliases in CATEGORY_ALIASES.items():
-        for option in [category, *aliases]:
-            opt_norm = _normalize(option)
-            opt_compact = _compact_normalize(option)
-            if not opt_norm:
-                continue
-            if normalized == opt_norm or compact == opt_compact:
-                exact_hits.append((category, option))
-            elif len(opt_compact) >= 3 and opt_compact in compact:
-                exact_hits.append((category, option))
-            elif len(compact) >= 3 and compact in opt_compact and len(compact) >= max(3, len(opt_compact) - 2):
-                exact_hits.append((category, option))
-    if exact_hits:
-        category, option = exact_hits[0]
-        return category, (typo_source or option), 1.0
-
-    category, option, score = _best_alias_match(normalized_query)
-    if category and score >= 0.80:
-        return category, (typo_source or option), score
-
-    if len(compact) <= 4:
-        if category and score >= 0.72:
-            return category, (typo_source or option), score
-        return None, (typo_source or option if typo_source else None), 0.0
-
-    q_tokens = set(_meaningful_tokens(normalized_query))
-    best_pair = None
-    best_score = 0.0
-    for category, aliases in CATEGORY_ALIASES.items():
-        for option in [category, *aliases]:
-            opt_tokens = set(_meaningful_tokens(option))
-            token_overlap = len(q_tokens & opt_tokens) / max(len(q_tokens), 1) if q_tokens else 0.0
-            score = max(
-                token_overlap,
-                SequenceMatcher(None, normalized, _normalize(option)).ratio() * 0.60 + token_overlap * 0.40,
-                SequenceMatcher(None, _thai_heavy_normalize(normalized_query), _thai_heavy_normalize(option)).ratio() * 0.60 + token_overlap * 0.40,
-            )
-            if score > best_score:
-                best_pair = (category, option)
-                best_score = score
-    if best_pair and best_score >= 0.58:
-        return best_pair[0], (typo_source or best_pair[1]), best_score
-    return None, (typo_source or None), 0.0
-
-
 def _category_browse_candidates(category: str, limit: int = 8) -> list[RetrievalCandidate]:
-    rows = [r for r in state.records if str(r.get("category") or "").strip() == category]
+    rows = _rows_for_category_scope(category)
     out: list[RetrievalCandidate] = []
     for row in rows[:limit]:
         out.append(
@@ -663,7 +1409,11 @@ def _is_broad_category_query(query: str, category_hint: str | None) -> bool:
 def _should_category_overview(query: str, category_hint: str | None, category_candidates: list[RetrievalCandidate], matched_alias: str | None, best_candidate: RetrievalCandidate | None) -> bool:
     if not category_hint:
         return False
+    if best_candidate and best_candidate.final_score >= 0.95:
+        return False
     q = _normalize(query)
+    if category_hint == "วัคซีน" and q == "วัคซีน":
+        return True
     matched_norm = _normalize(matched_alias or "")
     category_norm = _normalize(category_hint)
     broad = q in {matched_norm, category_norm} or _is_broad_category_query(query, category_hint)
@@ -683,32 +1433,28 @@ def _unknown_specific_in_category(query: str, category_hint: str | None, best_ca
     return len(q) >= 15 and not _has_specific_match(query, best_candidate)
 
 
+def _looks_like_specific_unknown_query(query: str, best_candidate: RetrievalCandidate | None = None) -> bool:
+    if best_candidate is not None and best_candidate.final_score >= 0.35:
+        return False
+    compact = _compact_normalize(query)
+    if len(compact) < 10:
+        return False
+    if _is_schedule_query(query):
+        return False
+    consonants_only = re.sub(r"[ะาำิีึืุูเแโใไั็ง่้๊๋์0-9]", "", compact)
+    if len(compact) >= 4 and len(consonants_only) == len(compact):
+        return False
+    return True
+
+
 def _is_follow_up_query(query: str) -> bool:
+    if _is_schedule_query(query):
+        return False
     q = _normalize(query)
-    generic_phrases = {"ราคาเท่าไหร่", "เท่าไหร่", "ติดต่อที่ไหน", "เปิดวันไหน", "เปิดกี่โมง", "เข้าได้เลยไหม", "มีไหม"}
+    generic_phrases = {"ราคาเท่าไหร่", "เท่าไหร่", "ติดต่อที่ไหน", "เปิดวันไหน", "เปิดกี่โมง", "เข้าได้เลยไหม", "มีไหม", "มีรูปไหม", "มีภาพไหม", "ขอดูรูป", "มีไฟล์ไหม", "มีลิงก์ไหม"}
     if q in generic_phrases:
         return True
     return len(q) <= 18 and bool(FOLLOW_UP_RE.search(q))
-
-
-def _topic_follow_up_buttons(topic: RetrievalCandidate) -> list[str]:
-    category_title = display_category_name(topic.category)
-    buttons = ["ราคาเท่าไหร่", "ติดต่อที่ไหน", "เปิดวันไหน", f"กลับไปหมวด{category_title}"]
-    seen: list[str] = []
-    for b in buttons:
-        if b not in seen:
-            seen.append(b)
-    return seen
-
-
-def _category_action_buttons(category: str, candidates: list[RetrievalCandidate]) -> list[str]:
-    buttons = [c.question for c in candidates[:6] if c.question]
-    buttons.append("กลับหน้าแรก")
-    seen: list[str] = []
-    for b in buttons:
-        if b not in seen:
-            seen.append(b)
-    return seen[:8]
 
 
 def _remember(session: SessionMemory, *, category: str | None, topic: RetrievalCandidate | None = None, buttons: list[str] | None = None) -> None:
@@ -717,7 +1463,7 @@ def _remember(session: SessionMemory, *, category: str | None, topic: RetrievalC
     if topic is not None:
         session.last_topic_id = topic.id
         session.last_topic_question = topic.question
-        session.last_category = topic.category
+        session.last_category = _canonical_category_for_candidate(topic, topic.question) or topic.category
     if buttons is not None:
         session.last_buttons = buttons[:8]
     session.touch()
@@ -732,10 +1478,136 @@ def _find_candidate_by_id(candidate_id: str | None) -> RetrievalCandidate | None
     return None
 
 
+def _image_path_to_url(path: str) -> str:
+    """Convert a local Windows image path to a public /assets/... URL."""
+    p = str(path or "").strip()
+    if not p:
+        return ""
+    # Already a URL
+    if p.startswith("/assets/") or p.startswith("http"):
+        return p
+    path_obj = Path(p)
+    filename = path_obj.name
+    # Determine asset root by checking which root directory is a parent
+    if SCHEDULE_IMAGE_DIR.exists():
+        try:
+            path_obj.relative_to(SCHEDULE_IMAGE_DIR)
+            return f"/assets/schedule/{filename}"
+        except ValueError:
+            pass
+    if HEALTH_CHECK_IMAGE_DIR.exists():
+        try:
+            path_obj.relative_to(HEALTH_CHECK_IMAGE_DIR)
+            return f"/assets/health-check/{filename}"
+        except ValueError:
+            pass
+    # Fallback: guess by folder name in path
+    if "ตารางออกตรวจแพทย์" in p or "ตารางออกตรวจ" in p:
+        return f"/assets/schedule/{filename}"
+    if "ตรวจสุขภาพ" in p:
+        return f"/assets/health-check/{filename}"
+    return ""
+
+
+def _topic_follow_up_buttons(topic: RetrievalCandidate) -> list[str]:
+    """Return category-aware quick-reply buttons for a topic."""
+    raw_category = str(topic.category or "").strip()
+    canonical_cat = _canonical_category_for_candidate(topic, topic.question) or raw_category
+    parent_theme = CATEGORY_TO_MAIN_THEME.get(canonical_cat, CATEGORY_TO_MAIN_THEME.get(raw_category, ""))
+
+    # Determine which slots are relevant
+    is_schedule = canonical_cat in {"\u0e15\u0e32\u0e23\u0e32\u0e07\u0e41\u0e1e\u0e17\u0e22\u0e4c\u0e41\u0e25\u0e30\u0e40\u0e27\u0e25\u0e32\u0e17\u0e33\u0e01\u0e32\u0e23"} or raw_category in {"\u0e19\u0e31\u0e14\u0e2b\u0e21\u0e32\u0e22\u0e41\u0e25\u0e30\u0e15\u0e32\u0e23\u0e32\u0e07\u0e41\u0e1e\u0e17\u0e22\u0e4c"}
+    is_job = canonical_cat == "\u0e01\u0e25\u0e38\u0e48\u0e21\u0e07\u0e32\u0e19\u0e1a\u0e38\u0e04\u0e04\u0e25" or raw_category in {"\u0e15\u0e34\u0e14\u0e15\u0e48\u0e2d\u0e2b\u0e19\u0e48\u0e27\u0e22\u0e07\u0e32\u0e19\u0e40\u0e09\u0e1e\u0e32\u0e30\u0e41\u0e25\u0e30\u0e2a\u0e21\u0e31\u0e04\u0e23\u0e07\u0e32\u0e19"}
+    is_health_check = canonical_cat in {"\u0e15\u0e23\u0e27\u0e08\u0e2a\u0e38\u0e02\u0e20\u0e32\u0e1e\u0e23\u0e32\u0e22\u0e1a\u0e38\u0e04\u0e04\u0e25", "\u0e15\u0e23\u0e27\u0e08\u0e2a\u0e38\u0e02\u0e20\u0e32\u0e1e\u0e2d\u0e07\u0e04\u0e4c\u0e01\u0e23\u0e41\u0e25\u0e30\u0e2a\u0e34\u0e17\u0e18\u0e34\u0e40\u0e1a\u0e34\u0e01\u0e08\u0e48\u0e32\u0e22"}
+    is_vaccine = canonical_cat == "\u0e27\u0e31\u0e04\u0e0b\u0e35\u0e19" or canonical_cat == "\u0e2a\u0e27\u0e31\u0e2a\u0e14\u0e34\u0e01\u0e32\u0e23\u0e27\u0e31\u0e04\u0e0b\u0e35\u0e19\u0e19\u0e31\u0e01\u0e28\u0e36\u0e01\u0e29\u0e32"
+    has_image = bool(_slot_value(topic, "image"))
+    has_link = bool(_slot_value(topic, "link"))
+
+    buttons: list[str] = []
+    if is_schedule:
+        if has_image:
+            buttons.append("มีรูปไหม")
+        buttons += ["ดูตารางสาขาอื่น", "เลือกแผนกตารางแพทย์", "เวลาทำการแผนกผู้ป่วยนอก"]
+        back_label = f"\u0e01\u0e25\u0e31\u0e1a\u0e44\u0e1b\u0e2b\u0e21\u0e27\u0e14\u0e19\u0e31\u0e14\u0e2b\u0e21\u0e32\u0e22\u0e41\u0e25\u0e30\u0e15\u0e32\u0e23\u0e32\u0e07\u0e41\u0e1e\u0e17\u0e22\u0e4c"
+    elif is_job:
+        buttons += ["\u0e15\u0e34\u0e14\u0e15\u0e48\u0e2d\u0e17\u0e35\u0e48\u0e44\u0e2b\u0e19"]
+        back_label = f"\u0e01\u0e25\u0e31\u0e1a\u0e44\u0e1b\u0e2b\u0e21\u0e27\u0e14\u0e15\u0e34\u0e14\u0e15\u0e48\u0e2d\u0e2b\u0e19\u0e48\u0e27\u0e22\u0e07\u0e32\u0e19\u0e40\u0e09\u0e1e\u0e32\u0e30\u0e41\u0e25\u0e30\u0e2a\u0e21\u0e31\u0e04\u0e23\u0e07\u0e32\u0e19"
+    elif is_vaccine:
+        buttons += ["\u0e23\u0e32\u0e04\u0e32\u0e40\u0e17\u0e48\u0e32\u0e44\u0e2b\u0e23\u0e48", "\u0e15\u0e34\u0e14\u0e15\u0e48\u0e2d\u0e17\u0e35\u0e48\u0e44\u0e2b\u0e19", "\u0e40\u0e1b\u0e34\u0e14\u0e27\u0e31\u0e19\u0e44\u0e2b\u0e19"]
+        back_label = f"\u0e01\u0e25\u0e31\u0e1a\u0e44\u0e1b\u0e2b\u0e21\u0e27\u0e14\u0e27\u0e31\u0e04\u0e0b\u0e35\u0e19\u0e41\u0e25\u0e30\u0e1a\u0e23\u0e34\u0e01\u0e32\u0e23\u0e1c\u0e39\u0e49\u0e1b\u0e48\u0e27\u0e22\u0e19\u0e2d\u0e01"
+    elif is_health_check:
+        buttons += ["\u0e23\u0e32\u0e04\u0e32\u0e40\u0e17\u0e48\u0e32\u0e44\u0e2b\u0e23\u0e48", "\u0e15\u0e34\u0e14\u0e15\u0e48\u0e2d\u0e17\u0e35\u0e48\u0e44\u0e2b\u0e19", "\u0e40\u0e1b\u0e34\u0e14\u0e27\u0e31\u0e19\u0e44\u0e2b\u0e19"]
+        if has_image:
+            buttons.append("\u0e21\u0e35\u0e23\u0e39\u0e1b\u0e44\u0e2b\u0e21")
+        back_label = f"\u0e01\u0e25\u0e31\u0e1a\u0e44\u0e1b\u0e2b\u0e21\u0e27\u0e14\u0e15\u0e23\u0e27\u0e08\u0e2a\u0e38\u0e02\u0e20\u0e32\u0e1e\u0e41\u0e25\u0e30\u0e43\u0e1a\u0e23\u0e31\u0e1a\u0e23\u0e2d\u0e07\u0e41\u0e1e\u0e17\u0e22\u0e4c"
+    else:
+        buttons += ["\u0e23\u0e32\u0e04\u0e32\u0e40\u0e17\u0e48\u0e32\u0e44\u0e2b\u0e23\u0e48", "\u0e15\u0e34\u0e14\u0e15\u0e48\u0e2d\u0e17\u0e35\u0e48\u0e44\u0e2b\u0e19", "\u0e40\u0e1b\u0e34\u0e14\u0e27\u0e31\u0e19\u0e44\u0e2b\u0e19", "\u0e40\u0e02\u0e49\u0e32\u0e44\u0e14\u0e49\u0e40\u0e25\u0e22\u0e44\u0e2b\u0e21"]
+        if has_image:
+            buttons.append("\u0e21\u0e35\u0e23\u0e39\u0e1b\u0e44\u0e2b\u0e21")
+        if has_link:
+            buttons.append("\u0e21\u0e35\u0e25\u0e34\u0e07\u0e01\u0e4c\u0e44\u0e2b\u0e21")
+        # Build back label from parent theme
+        if parent_theme:
+            back_label = f"\u0e01\u0e25\u0e31\u0e1a\u0e44\u0e1b\u0e2b\u0e21\u0e27\u0e14{parent_theme}"
+        else:
+            category_title = display_category_name(raw_category)
+            back_label = f"\u0e01\u0e25\u0e31\u0e1a\u0e44\u0e1b\u0e2b\u0e21\u0e27\u0e14{category_title}"
+    buttons.append(back_label)
+    return list(dict.fromkeys(buttons))
+
+
+def _category_action_buttons(category: str, candidates: list[RetrievalCandidate]) -> list[str]:
+    # Use MAIN_THEME_CHILDREN if category is a main-theme label
+    if category in MAIN_THEME_CHILDREN:
+        return list(MAIN_THEME_CHILDREN[category])
+    if category == "ตารางแพทย์และเวลาทำการ":
+        return ["ตารางแพทย์ออกตรวจ", "เวลาทำการแผนกผู้ป่วยนอก", "กลับไปหมวดนัดหมายและตารางแพทย์"]
+
+    if category == "ตารางแพทย์และเวลาทำการ":
+        return ["ตารางแพทย์ออกตรวจ", "เวลาทำการแผนกผู้ป่วยนอก", "กลับหน้าหลัก"]
+
+    # Special case for main theme raw categories that should show child canonical categories
+    if category == "\u0e19\u0e31\u0e14\u0e2b\u0e21\u0e32\u0e22\u0e41\u0e25\u0e30\u0e15\u0e32\u0e23\u0e32\u0e07\u0e41\u0e1e\u0e17\u0e22\u0e4c":
+        return list(MAIN_THEME_CHILDREN.get("\u0e19\u0e31\u0e14\u0e2b\u0e21\u0e32\u0e22\u0e41\u0e25\u0e30\u0e15\u0e32\u0e23\u0e32\u0e07\u0e41\u0e1e\u0e17\u0e22\u0e4c", ["\u0e01\u0e32\u0e23\u0e08\u0e31\u0e14\u0e01\u0e32\u0e23\u0e19\u0e31\u0e14\u0e2b\u0e21\u0e32\u0e22", "\u0e15\u0e32\u0e23\u0e32\u0e07\u0e41\u0e1e\u0e17\u0e22\u0e4c\u0e41\u0e25\u0e30\u0e40\u0e27\u0e25\u0e32\u0e17\u0e33\u0e01\u0e32\u0e23", "\u0e01\u0e25\u0e31\u0e1a\u0e2b\u0e19\u0e49\u0e32\u0e2b\u0e25\u0e31\u0e01"]))
+
+    child_topics = _unique_category_children(category)
+    buttons = list(child_topics[:6]) if child_topics else [c.question for c in candidates[:6] if c.question]
+    buttons.append("\u0e01\u0e25\u0e31\u0e1a\u0e2b\u0e19\u0e49\u0e32\u0e2b\u0e25\u0e31\u0e01")
+    return list(dict.fromkeys([b for b in buttons if b]))[:8]
+
+
+def _child_topic_action_buttons(category: str, child_topic: str) -> list[str]:
+    """Buttons shown after user selects a child topic."""
+    if child_topic == "ตารางแพทย์ออกตรวจ":
+        return list(SCHEDULE_DEPARTMENT_MENU)
+    rows = _child_topic_leaf_rows(category, child_topic)
+    buttons = [str(r.get("question") or "").strip() for r in rows[:8]]
+    buttons = [b for b in buttons if b]
+    parent_theme = CATEGORY_TO_MAIN_THEME.get(child_topic, CATEGORY_TO_MAIN_THEME.get(category, ""))
+    if parent_theme:
+        buttons.append(f"\u0e01\u0e25\u0e31\u0e1a\u0e44\u0e1b\u0e2b\u0e21\u0e27\u0e14{parent_theme}")
+    else:
+        buttons.append(f"\u0e01\u0e25\u0e31\u0e1a\u0e44\u0e1b\u0e2b\u0e21\u0e27\u0e14{display_category_name(category)}")
+    return list(dict.fromkeys(buttons))[:8]
+
+
+def _normalize_schedule_department(query: str) -> str | None:
+    q = _compact_normalize(query)
+    if not q:
+        return None
+    for department in SCHEDULE_DEPARTMENT_SPECIALTIES:
+        dept_compact = _compact_normalize(department)
+        if dept_compact and (q == dept_compact or q in dept_compact or dept_compact in q):
+            return department
+    return None
+
+
 def _answer_from_topic_follow_up(query: str, session: SessionMemory) -> RetrievalCandidate | None:
     topic = _find_candidate_by_id(session.last_topic_id)
     if topic is None:
         return None
+    if _detect_followup_slot(query):
+        return topic
     combined = f"{topic.question} {query}"
     candidates = _catalog_search(combined, category=session.last_category, limit=5)
     if candidates and candidates[0].final_score >= 0.65:
@@ -743,10 +1615,110 @@ def _answer_from_topic_follow_up(query: str, session: SessionMemory) -> Retrieva
     return topic if _is_follow_up_query(query) else None
 
 
+GROUNDED_LLM_FALLBACK_TEXT = "ไม่พบข้อมูลนี้ในระบบปัจจุบัน กรุณาติดต่อโรงพยาบาลมหาวิทยาลัยพะเยาเพื่อสอบถามเพิ่มเติม"
+
+
+def _candidate_title(candidate: RetrievalCandidate | None) -> str:
+    if candidate is None:
+        return ""
+    return (candidate.question or candidate.subcategory or candidate.category or "").strip()
+
+
+def _kb_context_blob(candidates: list[RetrievalCandidate]) -> str:
+    lines: list[str] = []
+    for cand in candidates[:3]:
+        lines.append(f"source_id={cand.id}")
+        lines.append(f"category={cand.category}")
+        lines.append(f"title={_candidate_title(cand)}")
+        lines.append(f"answer={cand.answer}")
+        if cand.notes:
+            lines.append(f"notes={cand.notes}")
+        if cand.department:
+            lines.append(f"department={cand.department}")
+        if cand.contact:
+            lines.append(f"contact={cand.contact}")
+    return "\n".join(lines)
+
+
+def _extract_structured_tokens(text: str) -> set[str]:
+    tokens: set[str] = set()
+    for pattern in (
+        r"https?://\S+",
+        r"www\.\S+",
+        r"\b\d{2,}(?:[-/:]\d+)*\b",
+    ):
+        tokens.update(re.findall(pattern, text or "", flags=re.IGNORECASE))
+    return {token.strip() for token in tokens if token.strip()}
+
+
+def _grounded_llm_reject_reason(content: str, kb_context: str) -> str | None:
+    text = (content or "").strip()
+    if not text:
+        return "empty_content"
+    if text == GROUNDED_LLM_FALLBACK_TEXT:
+        return None
+    if len(text) > 1200:
+        return "too_long"
+    lowered = text.lower()
+    for marker in ("http://", "https://", "www.", "@line", "facebook"):
+        if marker in lowered and marker not in kb_context.lower():
+            return "unsupported_url_or_handle"
+    kb_tokens = _extract_structured_tokens(kb_context)
+    for token in _extract_structured_tokens(text):
+        if token not in kb_tokens:
+            return f"structured_fact_not_in_kb:{token}"
+    for keyword in (
+        "วินิจฉัย",
+        "รับประทานยา",
+        "กินยา",
+        "ใช้ยา",
+        "รักษาเอง",
+        "แนะนำยา",
+        "จ่ายยา",
+        "ปรับยา",
+    ):
+        if keyword in text and keyword not in kb_context:
+            return f"unsafe_keyword:{keyword}"
+    return None
+
+
+def _log_answer_mode(mode: str, *, top: RetrievalCandidate, model_name: str | None = None, fallback_reason: str | None = None) -> None:
+    logger.info(
+        "answer_mode=%s source_id=%s category=%s title=%s model=%s fallback_reason=%s",
+        mode,
+        top.id,
+        top.category,
+        _candidate_title(top),
+        model_name or "-",
+        fallback_reason or "-",
+    )
+
+
 def _generate_answer(query: str, top: RetrievalCandidate, candidates: list[RetrievalCandidate], use_llm: bool) -> str:
     """Generate answer using LLM if available; fall back to KB direct answer."""
     model_state = runtime_summary(SERVING_LOCK_PATH)
     t_start = time.time()
+    kb_direct_answer = format_direct_answer(top)
+    model_name = (
+        TYPHOON_MODEL if LLM_PROVIDER == "typhoon"
+        else OPENAI_MODEL if LLM_PROVIDER == "openai"
+        else model_state.get("runtime_model", "")
+    )
+    kb_context_candidates = [cand for cand in candidates if cand][:3] or [top]
+    kb_context = _kb_context_blob(kb_context_candidates)
+
+    if not use_llm:
+        _log_answer_mode("kb_direct", top=top, model_name=model_name, fallback_reason="use_llm_false")
+        return kb_direct_answer
+    if not RAG_GROUNDED_LLM:
+        _log_answer_mode("kb_direct", top=top, model_name=model_name, fallback_reason="grounded_llm_disabled")
+        return kb_direct_answer
+    if not kb_context.strip():
+        _log_answer_mode("kb_direct", top=top, model_name=model_name, fallback_reason="empty_kb_context")
+        return kb_direct_answer
+    if ANSWER_MODE == "kb_exact" and top:
+        _log_answer_mode("kb_direct", top=top, model_name=model_name, fallback_reason="answer_mode_kb_exact")
+        return kb_direct_answer
 
     if use_llm and LLM_PROVIDER in {"typhoon", "openai"}:
         try:
@@ -759,18 +1731,21 @@ def _generate_answer(query: str, top: RetrievalCandidate, candidates: list[Retri
                 logger.error("❌ %s API Key missing in environment — using KB fallback", LLM_PROVIDER.upper())
             else:
                 client = OpenAI(api_key=api_key, base_url=base_url)
-                logger.info("🤖 %s call → model=%s query='%s'", LLM_PROVIDER.upper(), model_name, query[:60])
+                logger.info("🤖 %s call (mode=%s) → model=%s query='%s'", LLM_PROVIDER.upper(), ANSWER_MODE, model_name, query[:60])
                 chat_completion = client.chat.completions.create(
-                    messages=build_llm_messages(query, top, candidates),
+                    messages=build_grounded_llm_messages(query, top, kb_context_candidates),
                     model=model_name,
-                    temperature=0.1,
-                    max_tokens=1024,
+                    temperature=0.0,
+                    max_tokens=512,
                 )
                 content = chat_completion.choices[0].message.content.strip()
+                reject_reason = _grounded_llm_reject_reason(content, kb_context)
                 latency = round(time.time() - t_start, 2)
-                if content:
+                if content and not reject_reason:
                     logger.info("✅ %s answer returned in %.2fs", LLM_PROVIDER.upper(), latency)
+                    _log_answer_mode("llm_grounded_rewrite", top=top, model_name=model_name)
                     return content
+                _log_answer_mode("kb_direct", top=top, model_name=model_name, fallback_reason=reject_reason or "empty_content")
         except Exception as exc:
             latency = round(time.time() - t_start, 2)
             logger.error("❌ %s error after %.2fs: %s — using KB fallback", LLM_PROVIDER.upper(), latency, exc)
@@ -781,11 +1756,11 @@ def _generate_answer(query: str, top: RetrievalCandidate, candidates: list[Retri
         try:
             payload = {
                 "model": model_name,
-                "messages": build_llm_messages(query, top, candidates),
+                "messages": build_grounded_llm_messages(query, top, kb_context_candidates),
                 "stream": False,
-                "options": {"temperature": 0.1, "num_ctx": 2048},
+                "options": {"temperature": 0.0, "num_ctx": 2048},
             }
-            logger.info("🤖 LLM call (Ollama) → model=%s endpoint=%s query='%s'", model_name, endpoint, query[:60])
+            logger.info("🤖 LLM call (Ollama, mode=%s) → model=%s endpoint=%s query='%s'", ANSWER_MODE, model_name, endpoint, query[:60])
             response = requests.post(
                 f"{endpoint}/api/chat",
                 json=payload,
@@ -794,9 +1769,11 @@ def _generate_answer(query: str, top: RetrievalCandidate, candidates: list[Retri
             response.raise_for_status()
             data = response.json()
             content = data.get("message", {}).get("content", "").strip()
+            reject_reason = _grounded_llm_reject_reason(content, kb_context)
             latency = round(time.time() - t_start, 2)
-            if content:
+            if content and not reject_reason:
                 logger.info("✅ LLM answer returned in %.2fs", latency)
+                _log_answer_mode("llm_grounded_rewrite", top=top, model_name=model_name)
                 return content
             else:
                 logger.warning("⚠️  LLM returned empty content after %.2fs", latency)
@@ -810,7 +1787,8 @@ def _generate_answer(query: str, top: RetrievalCandidate, candidates: list[Retri
             logger.error("❌ LLM error after %.2fs: %s — using KB fallback", latency, exc)
 
     # KB direct answer fallback
-    return format_direct_answer(top)
+    _log_answer_mode("kb_direct", top=top, model_name=model_name, fallback_reason="llm_fallback")
+    return kb_direct_answer
 
 
 # ── Request / Response models ─────────────────────────────────────────────────
@@ -844,6 +1822,13 @@ class CandidateResponse(BaseModel):
     last_updated_at: str | None = None
 
 
+class Attachment(BaseModel):
+    type: Literal["image", "file"] = "image"
+    label: str = ""
+    url: str = ""
+    filename: str = ""
+
+
 class ChatResponse(BaseModel):
     route: Literal["answer", "clarify", "fallback"]
     answer: str
@@ -854,10 +1839,12 @@ class ChatResponse(BaseModel):
     selected_category: str | None = None
     clarification_options: list[str] = []
     action_buttons: list[str] = []
+    attachments: list[Attachment] = []
     candidates: list[CandidateResponse] = []
     handoff_required: bool = False
     handoff_ticket_id: int | None = None
     admin_reply: str | None = None
+    is_fallback_reset: bool = False
 
 
 class GuideResponse(BaseModel):
@@ -900,6 +1887,39 @@ def _should_create_handoff(response: ChatResponse) -> bool:
 
 
 def _finalize_chat_response(req: ChatRequest, session: SessionMemory, query: str, response: ChatResponse) -> ChatResponse:
+    if response.selected_category and _category_rule(response.selected_category):
+        response.selected_category = response.selected_category
+    elif response.source_id:
+        response.selected_category = _canonical_category_for_candidate(_find_candidate_by_id(response.source_id), query) or response.selected_category
+    else:
+        response.selected_category = _canonical_category_from_values(response.selected_category, None, query) or response.selected_category
+    # ── Fallback tracking & auto-reset ────────────────────────────────────
+    # Safe reasons that must NOT be overwritten by auto-reset
+    _safe_fallback_reasons = {"unsupported_specific_query", "chat_unhandled_exception", "safe_unsupported_fallback", "emergency_redirect"}
+    is_safe_fallback = response.reason in _safe_fallback_reasons
+
+    # If route is fallback OR (clarify with very low confidence), count as failure
+    is_failure = response.route == "fallback" or (response.route == "clarify" and response.confidence < 0.45)
+
+    if is_failure and not is_safe_fallback:
+        session.fallback_count += 1
+        logger.info("⚠️ Session %s fallback_count incremented to %d (route=%s, confidence=%.2f)", session.session_id[:12], session.fallback_count, response.route, response.confidence)
+        if session.fallback_count >= 2:
+            logger.info("🔄 Fallback auto-reset for session %s (count=%d)", session.session_id[:12], session.fallback_count)
+            session.reset_context(auto=True)
+            response.is_fallback_reset = True
+            response.answer = unclear_input_text()
+            response.action_buttons = list(MAIN_THEME_BUTTONS)
+            response.selected_category = None
+    else:
+        if session.fallback_count > 0:
+            logger.info("✅ Session %s fallback_count reset from %d to 0 (route=%s)", session.session_id[:12], session.fallback_count, response.route)
+        session.fallback_count = 0
+
+    # ── Ensure fallback responses always show main theme buttons ──────────
+    if response.route == "fallback" and not response.action_buttons:
+        response.action_buttons = list(MAIN_THEME_BUTTONS)
+
     admin_reply = fetch_session_responses(ANALYTICS_DB_PATH, req.session_id, limit=1)
     if admin_reply:
         latest = admin_reply[0]
@@ -954,6 +1974,160 @@ def _to_candidate_response(candidate: RetrievalCandidate) -> CandidateResponse:
         stale=candidate.stale,
         last_updated_at=candidate.last_updated_at,
     )
+
+
+def _has_specific_match(query: str, candidate: RetrievalCandidate | None) -> bool:
+    if candidate is None:
+        return False
+    if _record_type(candidate) in {"menu_node", "child_topic", "guidance"}:
+        return False
+    q = _compact_normalize(query)
+    cq = _compact_normalize(candidate.question)
+    if not q or not cq:
+        return False
+    if q == cq:
+        return True
+    if len(q) >= 8 and q in cq:
+        return True
+    meta = candidate.metadata or {}
+    broad_labels = {
+        _compact_normalize(candidate.category),
+        _compact_normalize(_canonical_category_for_candidate(candidate, query) or ""),
+        *(_compact_normalize(label) for label in MAIN_THEME_BUTTONS),
+        *(_compact_normalize(label) for label in MAIN_THEME_CANONICAL.values()),
+    }
+    alias_fields = []
+    alias_fields.extend(_parse_list_field(meta.get("aliases")))
+    alias_fields.extend(_parse_list_field(meta.get("keywords")))
+    alias_fields.extend([
+        str(meta.get("topic") or "").strip(),
+        str(meta.get("subcategory") or "").strip(),
+    ])
+    for alias in alias_fields:
+        alias_compact = _compact_normalize(alias)
+        if not alias_compact or alias_compact in broad_labels:
+            continue
+        if q == alias_compact:
+            return True
+        if len(q) >= 8 and q in alias_compact:
+            return True
+    return candidate.final_score >= 0.82
+
+
+def _detect_preferred_category(query: str) -> tuple[str | None, str | None, float]:
+    q = _strip_runtime_wrappers(query.strip())
+    if not q:
+        return None, None, 0.0
+    normalized_query, typo_source = _normalize_typo(_looks_like_query_plus_noise(q))
+    normalized = _normalize(normalized_query)
+    compact_query = _compact_normalize(normalized_query)
+
+    menu_label = _extract_menu_navigation_label(q)
+    if menu_label:
+        canonical = MAIN_THEME_CANONICAL.get(menu_label, menu_label)
+        return canonical, (typo_source or menu_label), 1.0
+
+    if "นักศึกษา" in normalized_query and "วัคซีน" in normalized_query:
+        return "สวัสดิการวัคซีนนักศึกษา", (typo_source or normalized_query), 0.99
+    if "วัคซีนมะเร็งปากมดลูกฟรี" in normalized_query and not any(token in normalized_query for token in ("นักศึกษา", "นิสิต")):
+        return "วัคซีน", (typo_source or normalized_query), 0.99
+    if any(token in normalized_query for token in ("ใบรับรอง", "ใบขับขี่")):
+        return "การขอเอกสารทางการแพทย์", (typo_source or normalized_query), 0.99
+    if any(token in normalized_query for token in ("บริษัท", "หมู่คณะ", "พนักงาน", "หน่วยงาน", "เบิกตรง")) and "ตรวจสุขภาพ" in normalized_query:
+        return "ตรวจสุขภาพองค์กรและสิทธิเบิกจ่าย", (typo_source or normalized_query), 0.99
+    if any(token in normalized_query for token in ("ฟอกไต", "ไตเทียม", "ล้างไต", "ศูนย์ไต")):
+        return "ศูนย์ไตเทียม", (typo_source or normalized_query), 0.99
+    if any(token in normalized_query for token in ("บริจาคเลือด", "ธนาคารเลือด", "ให้เลือด")):
+        return "ธนาคารเลือดและบริจาคเลือด", (typo_source or normalized_query), 0.99
+    if any(token in normalized_query for token in ("หมอฟัน", "ทันตกรรม", "ทำฟัน", "โรงพยาบาลทันตกรรม")) and not _is_schedule_query(normalized_query):
+        return "คลินิกทันตกรรม", (typo_source or normalized_query), 0.99
+    if any(token in normalized_query for token in ("สมัครงาน", "งานบุคคล", "รับสมัครงาน")):
+        return "กลุ่มงานบุคคล", (typo_source or normalized_query), 0.99
+
+    schedule_markers = [
+        "ตารางแพทย์",
+        "ตารางหมอ",
+        "หมอออกวันไหน",
+        "หมอกระดูก",
+        "หมอผิวหนัง",
+        "หมอตา",
+        "สูตินรีเวช",
+        "กุมารแพทย์",
+        "หมอเด็ก",
+        "ent",
+        "อายุรกรรม",
+        "opd 1",
+        "opd 2",
+        "opd 3",
+        "opd 4",
+    ]
+    if any(_compact_normalize(marker) in compact_query for marker in schedule_markers) and (
+        "วันไหน" in normalized_query
+        or "วันนี้" in normalized_query
+        or "มีไหม" in normalized_query
+        or "เปิด" in normalized_query
+        or "เวลา" in normalized_query
+        or "ตาราง" in normalized_query
+    ):
+        return "ตารางแพทย์และเวลาทำการ", (typo_source or normalized_query), 0.98
+
+    appointment_markers = ["เลื่อนนัด", "ลืมวันนัด", "เช็ควันนัด", "นัดหมอ", "นัดพบแพทย์"]
+    if any(_compact_normalize(marker) in compact_query for marker in appointment_markers):
+        return "การจัดการนัดหมาย", (typo_source or normalized_query), 0.98
+
+    for override, (category, _) in TOPIC_ALIAS_OVERRIDES.items():
+        ov = _compact_normalize(override)
+        if ov == compact_query or (len(ov) >= 8 and ov in compact_query):
+            return category, (typo_source or override), 1.0
+
+    if normalized in AMBIGUOUS_QUERY_CATEGORIES:
+        return None, normalized, 0.0
+
+    exact_hits: list[tuple[str, str]] = []
+    for category, aliases in CATEGORY_ALIASES.items():
+        for option in [category, *aliases]:
+            opt_norm = _normalize(option)
+            opt_compact = _compact_normalize(option)
+            if not opt_norm:
+                continue
+            if normalized == opt_norm or compact_query == opt_compact:
+                exact_hits.append((category, option))
+            elif len(opt_compact) >= 3 and opt_compact in compact_query:
+                exact_hits.append((category, option))
+            elif len(compact_query) >= 3 and compact_query in opt_compact and len(compact_query) >= max(3, len(opt_compact) - 2):
+                exact_hits.append((category, option))
+    if exact_hits:
+        exact_hits.sort(key=lambda x: len(x[1]), reverse=True)
+        category, option = exact_hits[0]
+        return category, (typo_source or option), 1.0
+
+    category, option, score = _best_alias_match(normalized_query)
+    if category and score >= 0.80:
+        return category, (typo_source or option), score
+
+    if len(compact_query) <= 4:
+        if category and score >= 0.72:
+            return category, (typo_source or option), score
+        return None, (typo_source or option if typo_source else None), 0.0
+
+    q_tokens = set(_meaningful_tokens(normalized_query))
+    best_pair = None
+    best_score = 0.0
+    for category_name, aliases in CATEGORY_ALIASES.items():
+        for option_name in [category_name, *aliases]:
+            opt_tokens = set(_meaningful_tokens(option_name))
+            token_overlap = len(q_tokens & opt_tokens) / max(len(q_tokens), 1) if q_tokens else 0.0
+            score_value = max(
+                token_overlap,
+                SequenceMatcher(None, normalized, _normalize(option_name)).ratio() * 0.60 + token_overlap * 0.40,
+                SequenceMatcher(None, _thai_heavy_normalize(normalized_query), _thai_heavy_normalize(option_name)).ratio() * 0.60 + token_overlap * 0.40,
+            )
+            if score_value > best_score:
+                best_score = score_value
+                best_pair = (category_name, option_name)
+    if best_pair and best_score >= 0.65:
+        return best_pair[0], (typo_source or best_pair[1]), best_score
+    return None, (typo_source or None), 0.0
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -1049,10 +2223,148 @@ def admin_model_config(principal: AdminPrincipal = Depends(require_role("viewer"
     return runtime_summary(SERVING_LOCK_PATH)
 
 
-@app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest) -> ChatResponse:
+# ── Day-aware schedule helpers ────────────────────────────────────────────────
+THAI_DAY_MAP: dict[str, str] = {
+    "จันทร์": "จันทร์", "วันจันทร์": "จันทร์",
+    "อังคาร": "อังคาร", "วันอังคาร": "อังคาร",
+    "พุธ": "พุธ", "วันพุธ": "พุธ",
+    "พฤหัส": "พฤหัสบดี", "วันพฤหัสบดี": "พฤหัสบดี", "พฤหัสบดี": "พฤหัสบดี",
+    "ศุกร์": "ศุกร์", "วันศุกร์": "ศุกร์",
+    "เสาร์": "เสาร์", "วันเสาร์": "เสาร์",
+    "อาทิตย์": "อาทิตย์", "วันอาทิตย์": "อาทิตย์",
+}
+THAI_WEEKDAY_NAMES = ["จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์", "อาทิตย์"]
+
+
+def _detect_thai_day(query: str) -> str | None:
+    """Detect Thai weekday from query. Returns canonical Thai day name or None."""
+    import datetime, zoneinfo
+    q = _normalize(query)
+    if "วันนี้" in q:
+        bkk = zoneinfo.ZoneInfo("Asia/Bangkok")
+        return THAI_WEEKDAY_NAMES[datetime.datetime.now(bkk).weekday()]
+    if "พรุ่งนี้" in q:
+        bkk = zoneinfo.ZoneInfo("Asia/Bangkok")
+        return THAI_WEEKDAY_NAMES[(datetime.datetime.now(bkk).weekday() + 1) % 7]
+    for term, canonical in sorted(THAI_DAY_MAP.items(), key=lambda x: -len(x[0])):
+        if term in query:
+            return canonical
+    return None
+
+
+def _filter_answer_by_day(answer: str, day: str) -> str:
+    """Filter answer lines keeping only rows that mention the given day."""
+    lines = answer.split("\n")
+    result: list[str] = []
+    for line in lines:
+        stripped = line.lstrip("-• ")
+        if not line.startswith("-") and not line.startswith("•"):
+            result.append(line)
+        elif day in line:
+            result.append(line)
+    text = "\n".join(result).strip()
+    return text if text else answer
+
+
+def _format_schedule_answer(topic: RetrievalCandidate, day_filter: str | None = None) -> str:
+    """Normalize structured schedule answers and preserve blank-doctor rows safely."""
+    specialty = str((topic.metadata or {}).get("topic") or topic.question or "").strip()
+    department = str((topic.metadata or {}).get("clinic") or topic.department or "").strip()
+    raw_answer = str(topic.answer or "").strip()
+    if not raw_answer:
+        return format_direct_answer(topic)
+
+    lines = [line.rstrip() for line in raw_answer.splitlines() if line.strip()]
+    if not lines:
+        return format_direct_answer(topic)
+
+    header = lines[0].strip()
+    normalized_rows: list[str] = []
+    body_lines = lines[1:]
+    if not body_lines:
+        for item in _parse_list_field((topic.metadata or {}).get("followup_hours")):
+            if item:
+                normalized_rows.append(f"- {item} : ยังไม่ระบุชื่อแพทย์ในข้อมูล")
+    for line in body_lines:
+        stripped = line.strip()
+        if not stripped.startswith("-"):
+            if stripped.startswith("ไฟล์แนบ/รูปประกอบ:") or ":\\" in stripped:
+                continue
+            normalized_rows.append(stripped)
+            continue
+        body = stripped[1:].strip()
+        if ":" in body:
+            left, right = body.split(":", 1)
+            doctor = right.strip() or "ยังไม่ระบุชื่อแพทย์ในข้อมูล"
+            normalized_rows.append(f"- {left.strip()} : {doctor}")
+        else:
+            normalized_rows.append(f"- {body} : ยังไม่ระบุชื่อแพทย์ในข้อมูล")
+
+    if day_filter:
+        filtered_rows = [row for row in normalized_rows if day_filter in row]
+        if not filtered_rows:
+            specialty_label = specialty or header or "แพทย์เฉพาะทาง"
+            return (
+                f"ไม่พบตารางออกตรวจของ {specialty_label} ในวันดังกล่าวในระบบปัจจุบัน\n"
+                f"หากต้องการดูตารางรายสัปดาห์ทั้งหมด กรุณาพิมพ์ชื่อเฉพาะทางอีกครั้งค่ะ"
+            )
+        normalized_rows = filtered_rows
+
+    final_header = header
+    if normalized_rows:
+        section_title = "ตารางออกตรวจ:"
+        if day_filter:
+            section_title = f"ตารางออกตรวจวัน{day_filter}:"
+        if specialty and department and department not in header:
+            final_header = f"{specialty} — {department}"
+        return final_header + "\n\n" + section_title + "\n" + "\n".join(normalized_rows)
+    if specialty and department and department not in header:
+        final_header = f"{specialty} — {department}"
+    if normalized_rows:
+        return final_header + "\n\nตารางออกตรวจ:\n" + "\n".join(normalized_rows)
+    return final_header
+
+
+def _build_attachments_for_topic(topic: RetrievalCandidate, label_prefix: str = "รูปตารางแพทย์") -> list[Attachment]:
+    """Build Attachment list from followup_image_paths, converting Windows paths to public URLs."""
+    meta = topic.metadata or {}
+    raw_paths = _parse_list_field(meta.get("followup_image_paths"))
+    attachments: list[Attachment] = []
+    for raw_path in raw_paths:
+        url = _image_path_to_url(raw_path)
+        if url:
+            filename = Path(raw_path).name
+            topic_label = str(meta.get("topic") or topic.question or "").strip()
+            attachments.append(Attachment(
+                type="image",
+                label=f"{label_prefix} {topic_label}".strip(),
+                url=url,
+                filename=filename,
+            ))
+    return attachments
+
+
+def _build_health_check_attachments() -> list[Attachment]:
+    """Build attachments from the health check image folder."""
+    attachments: list[Attachment] = []
+    if not HEALTH_CHECK_IMAGE_DIR.exists():
+        return attachments
+    for img_file in sorted(HEALTH_CHECK_IMAGE_DIR.iterdir()):
+        if img_file.suffix.lower() in ALLOWED_ASSET_EXTENSIONS:
+            attachments.append(Attachment(
+                type="image",
+                label=f"รูปโปรแกรมตรวจสุขภาพ {img_file.stem}",
+                url=f"/assets/health-check/{img_file.name}",
+                filename=img_file.name,
+            ))
+    return attachments
+
+
+def _chat_impl(req: ChatRequest) -> ChatResponse:
     t_start = time.time()
     query = req.question.strip()
+    raw_query = query
+    wrapper_stripped_query = _strip_runtime_wrappers(query)
     logger.info("📨 /chat session=%s query='%s'", req.session_id[:12], query[:80])
 
     # ── KB not ready — friendly fallback instead of 503 ──
@@ -1071,18 +2383,192 @@ def chat(req: ChatRequest) -> ChatResponse:
         )
 
     session = state.get_session(req.session_id)
-    normalized_query, typo_source = _normalize_typo(_looks_like_query_plus_noise(query))
-    if typo_source and normalized_query != query:
-        query = normalized_query
+    normalized_query, typo_source = _normalize_typo(_looks_like_query_plus_noise(wrapper_stripped_query))
+    original_normalized_query = normalized_query
+
+    menu_label = _extract_menu_navigation_label(raw_query) or _extract_menu_navigation_label(original_normalized_query)
+    if menu_label:
+        canonical = MAIN_THEME_CANONICAL.get(menu_label, menu_label)
+        category_candidates = _category_browse_candidates(canonical)
+        buttons = _category_action_buttons(canonical, category_candidates)
+        _remember(session, category=canonical, buttons=buttons)
+        response = ChatResponse(
+            route="clarify",
+            answer=build_category_overview(canonical, buttons),
+            confidence=1.0,
+            reason="main_menu_navigation",
+            selected_category=canonical,
+            clarification_options=buttons,
+            action_buttons=buttons,
+            candidates=[_to_candidate_response(c) for c in category_candidates[:5]],
+        )
+        return _finalize_chat_response(req, session, raw_query, response)
+
+    for label in MAIN_THEME_BUTTONS:
+        canonical = MAIN_THEME_CANONICAL.get(label, label)
+        if _looks_like_menu_label(raw_query, label) or _looks_like_menu_label(wrapper_stripped_query, label) or _looks_like_menu_label(original_normalized_query, label):
+            category_candidates = _category_browse_candidates(canonical)
+            buttons = _category_action_buttons(canonical, category_candidates)
+            _remember(session, category=canonical, buttons=buttons)
+            response = ChatResponse(
+                route="clarify",
+                answer=build_category_overview(canonical, buttons),
+                confidence=1.0,
+                reason="main_menu_navigation",
+                selected_category=canonical,
+                clarification_options=buttons,
+                action_buttons=buttons,
+                candidates=[_to_candidate_response(c) for c in category_candidates[:5]],
+            )
+            return _finalize_chat_response(req, session, raw_query, response)
+
+    query = _strip_runtime_wrappers(_rewrite_runtime_query(original_normalized_query))
+
+    broad_vaccine_terms = {"วัคซีน", "วักซีน", "วัปซีน", "วคซีน"}
+    if _normalize(raw_query) in broad_vaccine_terms or _normalize(original_normalized_query) in broad_vaccine_terms:
+        category_candidates = _category_browse_candidates("วัคซีน")
+        buttons = _category_action_buttons("วัคซีน", category_candidates)
+        _remember(session, category="วัคซีน", buttons=buttons)
+        corrected_from = None if _normalize(raw_query) == "วัคซีน" else raw_query
+        response = ChatResponse(
+            route="clarify" if _normalize(raw_query) == "วัคซีน" else "answer",
+            answer=build_category_overview("วัคซีน", buttons, corrected_from=corrected_from),
+            confidence=0.98,
+            reason="broad_vaccine_navigation",
+            selected_category="วัคซีน",
+            clarification_options=buttons,
+            action_buttons=buttons,
+            candidates=[_to_candidate_response(c) for c in category_candidates[:5]],
+        )
+        return _finalize_chat_response(req, session, raw_query, response)
+
+    if "สมัครงาน" in _normalize(raw_query) and "ใบรับรอง" in _normalize(raw_query):
+        doc_candidates = _catalog_search("ขอใบรับรองแพทย์", category="การขอเอกสารทางการแพทย์", limit=3)
+        if doc_candidates:
+            doc_topic = doc_candidates[0]
+            buttons = _topic_follow_up_buttons(doc_topic)
+            _remember(session, category="การขอเอกสารทางการแพทย์", topic=doc_topic, buttons=buttons)
+            response = ChatResponse(
+                route="answer",
+                answer=format_direct_answer(doc_topic) + "\n\n" + build_followup_hint_text("การขอเอกสารทางการแพทย์", doc_topic.question),
+                confidence=max(round(doc_topic.final_score, 4), 0.9),
+                reason="job_medical_certificate_match",
+                source_id=doc_topic.id,
+                selected_category="การขอเอกสารทางการแพทย์",
+                action_buttons=buttons,
+                candidates=[_to_candidate_response(doc_topic)],
+            )
+            return _finalize_chat_response(req, session, raw_query, response)
+
+    for label in MAIN_THEME_BUTTONS:
+        canonical = MAIN_THEME_CANONICAL.get(label, label)
+        if _looks_like_menu_label(query, label) or _looks_like_menu_label(_strip_runtime_wrappers(query), label):
+            category_candidates = _category_browse_candidates(canonical)
+            buttons = _category_action_buttons(canonical, category_candidates)
+            _remember(session, category=canonical, buttons=buttons)
+            response = ChatResponse(
+                route="clarify",
+                answer=build_category_overview(canonical, buttons),
+                confidence=1.0,
+                reason="main_menu_navigation",
+                selected_category=canonical,
+                clarification_options=buttons,
+                action_buttons=buttons,
+                candidates=[_to_candidate_response(c) for c in category_candidates[:5]],
+            )
+            return _finalize_chat_response(req, session, query, response)
+
+    # Special case: Explicitly handle "นัดหมายและตารางแพทย์" to ensure both child branches are exposed
+    if _normalize(query) == "นัดหมายและตารางแพทย์":
+        canonical = "นัดหมายและตารางแพทย์"
+        buttons = MAIN_THEME_CHILDREN.get(canonical, ["การจัดการนัดหมาย", "ตารางแพทย์และเวลาทำการ", "กลับหน้าหลัก"])
+        _remember(session, category=canonical, buttons=buttons)
+        response = ChatResponse(
+            route="clarify",
+            answer="หมวด" + canonical + " มีหัวข้อย่อยที่เลือกได้ดังนี้\n" + "\n".join(f"- {b}" for b in buttons if b != "กลับหน้าหลัก") + "\nกรุณาเลือกหัวข้อที่ต้องการ หรือพิมพ์รายละเอียดเพิ่มได้เลยค่ะ",
+            confidence=1.0,
+            reason="main_menu_appointment_schedule_both_branches",
+            selected_category=canonical,
+            clarification_options=buttons,
+            action_buttons=buttons,
+        )
+        return _finalize_chat_response(req, session, raw_query, response)
+
+    # ── Strong new intent detection: override stale category context ──
+    # Guard: Only allow cross-category switching if NOT a follow-up query
+    # AND if we don't have an active topic that could answer the follow-up
+    new_cat, new_alias, new_score = _detect_preferred_category(query)
+    
+    # Check if this is a follow-up query that should bind to current topic
+    is_followup = _is_follow_up_query(query)
+    has_active_topic = session.last_topic_id is not None
+    
+    # If it's a follow-up and we have an active topic, suppress category switching
+    # to ensure follow-up binds to current topic first
+    if is_followup and has_active_topic:
+        logger.info("🔗 Follow-up query detected with active topic, suppressing category switch: %s", query[:50])
+        # Skip the category switch below
+    elif new_cat and new_score >= 0.85 and session.last_category and new_cat != session.last_category and not is_followup:
+        logger.info("🔄 Cross-category switch: %s → %s (score=%.2f)", session.last_category, new_cat, new_score)
+        session.last_category = new_cat
+        session.last_topic_id = None
+        session.last_topic_question = None
+    
+    # Special case: Image follow-up should NOT trigger category switch
+    # If current topic is a schedule topic and user asks for image, stay in that topic
+    if _is_image_follow_up(query) and session.last_topic_id and session.last_category:
+        # Check if current topic is schedule-related
+        current_topic = _find_candidate_by_id(session.last_topic_id)
+        if current_topic and "ตารางแพทย์" in session.last_category:
+            # Suppress category switching for image follow-ups in schedule topics
+            logger.info("🖼️  Image follow-up detected in schedule topic, preserving context: %s", session.last_category)
+
+    # ── Manual Reset / Back to Home ──
+    if re.search(r"เริ่มใหม่|หน้าแรก|หน้าหลัก|reset|เมนูหลัก", query, re.IGNORECASE):
+        session.reset_context()
+        return ChatResponse(
+            route="clarify",
+            answer=WELCOME_MESSAGE,
+            confidence=1.0,
+            reason="manual_reset",
+            action_buttons=list(MAIN_THEME_BUTTONS)
+        )
 
     if BACK_RE.search(query):
-        if session.last_category:
+        # Check if query is "กลับไปหมวด..."
+        back_match = re.search(r"\u0e01\u0e25\u0e31\u0e1a\u0e44\u0e1b\u0e2b\u0e21\u0e27\u0e14(.+)", query)
+        back_theme = None
+        if back_match:
+            back_label = back_match.group(1).strip()
+            # Find parent theme from MAIN_THEME_CHILDREN
+            for theme, children in MAIN_THEME_CHILDREN.items():
+                if any(_compact_normalize(c) == _compact_normalize(back_label) or _compact_normalize(theme) == _compact_normalize(back_label) for c in [theme]):
+                    back_theme = theme
+                    break
+            if not back_theme:
+                for theme in MAIN_THEME_BUTTONS:
+                    if _compact_normalize(back_label) in _compact_normalize(theme) or _compact_normalize(theme) in _compact_normalize(back_label):
+                        back_theme = theme
+                        break
+        if back_theme and back_theme in MAIN_THEME_CHILDREN:
+            buttons = list(MAIN_THEME_CHILDREN[back_theme])
+            _remember(session, category=back_theme, buttons=buttons)
+            return ChatResponse(
+                route="clarify",
+                answer="\u0e2b\u0e21\u0e27\u0e14" + back_theme + " \u0e21\u0e35\u0e2b\u0e31\u0e27\u0e02\u0e49\u0e2d\u0e22\u0e48\u0e2d\u0e22\u0e17\u0e35\u0e48\u0e40\u0e25\u0e37\u0e2d\u0e01\u0e44\u0e14\u0e49\u0e14\u0e31\u0e07\u0e19\u0e35\u0e49\n" + "\n".join(f"- {b}" for b in buttons if b != "\u0e01\u0e25\u0e31\u0e1a\u0e2b\u0e19\u0e49\u0e32\u0e2b\u0e25\u0e31\u0e01") + "\n\u0e01\u0e23\u0e38\u0e13\u0e32\u0e40\u0e25\u0e37\u0e2d\u0e01\u0e2b\u0e31\u0e27\u0e02\u0e49\u0e2d\u0e17\u0e35\u0e48\u0e15\u0e49\u0e2d\u0e07\u0e01\u0e32\u0e23 \u0e2b\u0e23\u0e37\u0e2d\u0e1e\u0e34\u0e21\u0e1e\u0e4c\u0e23\u0e32\u0e22\u0e25\u0e30\u0e40\u0e2d\u0e35\u0e22\u0e14\u0e40\u0e1e\u0e34\u0e48\u0e21\u0e44\u0e14\u0e49\u0e40\u0e25\u0e22\u0e04\u0e48\u0e30",
+                confidence=0.95,
+                reason="back_to_main_theme",
+                selected_category=back_theme,
+                clarification_options=buttons,
+                action_buttons=buttons,
+            )
+        elif session.last_category:
             category_candidates = _category_browse_candidates(session.last_category)
             buttons = _category_action_buttons(session.last_category, category_candidates)
             _remember(session, category=session.last_category, buttons=buttons)
             return ChatResponse(
                 route="clarify",
-                answer=build_category_overview(session.last_category, [c.question for c in category_candidates]),
+                answer=build_category_overview(session.last_category, buttons),
                 confidence=0.95,
                 reason="session_back_to_category",
                 selected_category=session.last_category,
@@ -1097,25 +2583,276 @@ def chat(req: ChatRequest) -> ChatResponse:
         return _finalize_chat_response(req, session, query, response)
 
     category_hint, matched_alias, alias_score = _detect_preferred_category(req.preferred_category or query)
-    if category_hint is None and session.last_category and _is_follow_up_query(query):
+    # If the session was just reset very recently, and the current query is a small follow-up
+    # (price/contact/hours), do not apply category routing — ask the user to pick a topic again.
+    if session.last_reset_at and (time.time() - session.last_reset_at) < 5 and _is_follow_up_query(query) and not _is_schedule_query(query):
+        logger.info("🔴 Post-reset follow-up ignored: session_id=%s, last_reset_at=%.2f, query=%s", session.session_id[:12], session.last_reset_at, query[:50])
+        return ChatResponse(
+            route="clarify",
+            answer=WELCOME_MESSAGE,
+            confidence=0.9,
+            reason="post_reset_followup_ignored",
+            action_buttons=list(MAIN_THEME_BUTTONS),
+        )
+    no_context_slot_queries = {
+        "ราคาเท่าไหร่",
+        "ราคาเท่าไร",
+        "ติดต่อที่ไหน",
+        "เปิดวันไหน",
+        "เปิดกี่โมง",
+        "เข้าได้เลยไหม",
+        "โทรอะไร",
+        "มีรูปไหม",
+        "มีภาพไหม",
+        "ขอดูรูป",
+        "มีไฟล์ไหม",
+        "มีลิงก์ไหม",
+    }
+    if _normalize(query) in no_context_slot_queries and not session.last_topic_id and not session.last_category and not category_hint:
+        return ChatResponse(
+            route="clarify",
+            answer=WELCOME_MESSAGE,
+            confidence=0.9,
+            reason="no_context_short_slot_query",
+            action_buttons=list(MAIN_THEME_BUTTONS),
+        )
+    if _normalize(query) == "มีไหม" and not session.last_topic_id and not session.last_category and not category_hint:
+        return ChatResponse(
+            route="fallback",
+            answer=unclear_input_text(),
+            confidence=0.92,
+            reason="naked_yesno_without_context",
+            action_buttons=GUIDE_ITEMS[:8],
+        )
+    if _is_follow_up_query(query) and not _is_schedule_query(query) and not session.last_topic_id and not session.last_category and not category_hint:
+        return ChatResponse(
+            route="clarify",
+            answer=WELCOME_MESSAGE,
+            confidence=0.9,
+            reason="followup_without_context",
+            action_buttons=list(MAIN_THEME_BUTTONS),
+        )
+    # Only apply session category as follow-up hint when we have a concrete last topic
+    if category_hint is None and session.last_category and session.last_topic_id and _is_follow_up_query(query) and not _is_schedule_query(query):
         category_hint = session.last_category
         matched_alias = session.last_category
-        alias_score = 0.7
+        alias_score = 0.50  # Reduced from 0.7 to make category switching easier
+
+    if _is_follow_up_query(query) and not _is_schedule_query(query) and not session.last_topic_id:
+        followup_category = session.last_category or category_hint
+        if followup_category:
+            category_candidates = _category_browse_candidates(followup_category)
+            buttons = _category_action_buttons(followup_category, category_candidates)
+            _remember(session, category=followup_category, buttons=buttons)
+            response = ChatResponse(
+                route="clarify",
+                answer=build_category_overview(_canonical_category_from_values(followup_category, None, query) or followup_category, buttons),
+                confidence=0.88,
+                reason="followup_requires_topic_context",
+                selected_category=followup_category,
+                clarification_options=buttons,
+                action_buttons=buttons,
+                candidates=[_to_candidate_response(c) for c in category_candidates[:5]],
+            )
+            return _finalize_chat_response(req, session, query, response)
+
+    schedule_query_norm = _normalize(query)
+    if schedule_query_norm == "ตารางแพทย์และเวลาทำการ":
+        buttons = ["ตารางแพทย์ออกตรวจ", "เวลาทำการแผนกผู้ป่วยนอก", "กลับไปหมวดนัดหมายและตารางแพทย์"]
+        _remember(session, category="ตารางแพทย์และเวลาทำการ", buttons=buttons)
+        response = ChatResponse(
+            route="clarify",
+            answer="หมวด ตารางแพทย์และเวลาทำการ มีหัวข้อย่อยที่เลือกได้ดังนี้",
+            confidence=1.0,
+            reason="schedule_category_menu",
+            selected_category="ตารางแพทย์และเวลาทำการ",
+            clarification_options=buttons,
+            action_buttons=buttons,
+            candidates=[],
+        )
+        return _finalize_chat_response(req, session, query, response)
+
+    if schedule_query_norm in {"ตารางแพทย์ออกตรวจ", "ดูตารางสาขาอื่น", "เลือกแผนกตารางแพทย์", "กลับไปเลือกแผนกตารางแพทย์"}:
+        buttons = list(SCHEDULE_DEPARTMENT_MENU)
+        _remember(session, category="ตารางแพทย์และเวลาทำการ", buttons=buttons)
+        response = ChatResponse(
+            route="clarify",
+            answer="ต้องการดูตารางแพทย์ของแผนกใดคะ",
+            confidence=0.99,
+            reason="schedule_department_menu",
+            selected_category="ตารางแพทย์และเวลาทำการ",
+            clarification_options=buttons,
+            action_buttons=buttons,
+            candidates=[],
+        )
+        return _finalize_chat_response(req, session, query, response)
+
+    if schedule_query_norm == "ค้นหาตามเฉพาะทาง":
+        buttons = list(SCHEDULE_SPECIALTY_MENU)
+        _remember(session, category="ตารางแพทย์และเวลาทำการ", buttons=buttons)
+        response = ChatResponse(
+            route="clarify",
+            answer="ต้องการทราบตารางแพทย์ของเฉพาะทางใดคะ",
+            confidence=0.99,
+            reason="schedule_specialty_menu",
+            selected_category="ตารางแพทย์และเวลาทำการ",
+            clarification_options=buttons,
+            action_buttons=buttons,
+            candidates=[],
+        )
+        return _finalize_chat_response(req, session, query, response)
+
+    schedule_department = _normalize_schedule_department(query)
+    if schedule_department:
+        buttons = list(SCHEDULE_DEPARTMENT_SPECIALTIES.get(schedule_department, []))
+        _remember(session, category="ตารางแพทย์และเวลาทำการ", buttons=buttons)
+        response = ChatResponse(
+            route="clarify",
+            answer=f"แผนก {schedule_department} มีเฉพาะทางดังนี้",
+            confidence=0.99,
+            reason="schedule_department_specialty_menu",
+            selected_category="ตารางแพทย์และเวลาทำการ",
+            clarification_options=buttons,
+            action_buttons=buttons,
+            candidates=[],
+        )
+        return _finalize_chat_response(req, session, query, response)
+
+    if _is_schedule_query(query):
+        schedule_match = _match_schedule_record(query)
+        broad_schedule = bool(re.fullmatch(r"(ตารางแพทย์|ตารางหมอ|หมอออกตรวจ|หมอเข้า|หมอวันนี้|แพทย์ออกตรวจ)", query.strip()))
+        schedule_q = _normalize(query)
+        if schedule_q in {"ตารางแพทย์ออกตรวจ", "เวลาทำการแผนกผู้ป่วยนอก"}:
+            broad_schedule = True
+        schedule_compact = _compact_normalize(query)
+        has_specialty_marker = any(
+            _compact_normalize(alias) in schedule_compact
+            for aliases in SCHEDULE_SPECIALTY_ALIASES.values()
+            for alias in aliases
+        )
+        generic_schedule_terms = ("วันไหน" in query or "วันนี้" in query or "มีไหม" in query)
+        broad_schedule = broad_schedule or (
+            not has_specialty_marker
+            and ("หมอ" in query or "แพทย์" in query)
+            and generic_schedule_terms
+        )
+        if schedule_match is not None and not broad_schedule:
+            answer_text = format_direct_answer(schedule_match)
+            # Day-aware filtering
+            day_filter = _detect_thai_day(query)
+            if day_filter:
+                filtered = _filter_answer_by_day(answer_text, day_filter)
+                if filtered and any("-" in line for line in filtered.split("\n")):
+                    answer_text = filtered
+                else:
+                    specialty = str((schedule_match.metadata or {}).get("topic") or schedule_match.question or "").strip()
+                    answer_text = f"ไม่พบตารางออกตรวจของ {specialty} ในวัน{day_filter}ในระบบปัจจุบัน หากต้องการดูตารางทั้งสัปดาห์ กรุณาพิมพ์ ຈักษุแพทย์ (ตา) หรือชื่อเฉพาะทางที่ต้องการค่ะ"
+            answer_text = _format_schedule_answer(schedule_match, day_filter=day_filter)
+            attachments = _build_attachments_for_topic(schedule_match)
+            buttons = _topic_follow_up_buttons(schedule_match)
+            _remember(session, category="ตารางแพทย์และเวลาทำการ", topic=schedule_match, buttons=buttons)
+            response = ChatResponse(
+                route="answer",
+                answer=answer_text,
+                confidence=max(round(schedule_match.final_score, 4), 0.9),
+                reason="schedule_specific_match",
+                source_id=schedule_match.id,
+                selected_category="ตารางแพทย์และเวลาทำการ",
+                action_buttons=buttons,
+                attachments=attachments,
+                candidates=[_to_candidate_response(schedule_match)],
+            )
+            return _finalize_chat_response(req, session, query, response)
+
+        schedule_q_norm = _normalize(query)
+        if any(token in schedule_q_norm for token in ("หมอฟัน", "ทันตกรรม", "หมอทันตกรรม")):
+            dental_candidates = _catalog_search("ทันตกรรม", category="คลินิกทันตกรรม", limit=3)
+            if dental_candidates:
+                dental_topic = dental_candidates[0]
+                slot_answer = _build_followup_slot_answer(dental_topic, query) if FOLLOWUP_MODE == "slot_first" else None
+                answer = slot_answer or format_direct_answer(dental_topic)
+                buttons = _topic_follow_up_buttons(dental_topic)
+                _remember(session, category="ตารางแพทย์และเวลาทำการ", topic=dental_topic, buttons=buttons)
+                session.last_category = "ตารางแพทย์และเวลาทำการ"
+                response = ChatResponse(
+                    route="answer",
+                    answer=answer + "\n\n" + build_followup_hint_text("ตารางแพทย์และเวลาทำการ", dental_topic.question),
+                    confidence=max(round(dental_topic.final_score, 4), 0.88),
+                    reason="schedule_alias_fallback_to_dental",
+                    source_id=dental_topic.id,
+                    selected_category="ตารางแพทย์และเวลาทำการ",
+                    action_buttons=buttons,
+                    candidates=[_to_candidate_response(dental_topic)],
+                )
+                return _finalize_chat_response(req, session, query, response)
+
+        clarify_buttons = _child_topic_action_buttons("นัดหมายและตารางแพทย์", "ตารางแพทย์ออกตรวจ")
+        _remember(session, category="ตารางแพทย์และเวลาทำการ", buttons=clarify_buttons)
+        response = ChatResponse(
+            route="clarify",
+            answer="ต้องการทราบตารางแพทย์ของแผนกหรือเฉพาะทางใดคะ",
+            confidence=0.96,
+            reason="schedule_clarification",
+            selected_category="ตารางแพทย์และเวลาทำการ",
+            clarification_options=clarify_buttons,
+            action_buttons=clarify_buttons,
+            candidates=[],
+        )
+        return _finalize_chat_response(req, session, query, response)
 
     if session.last_topic_id and _is_follow_up_query(query):
         follow_topic = _answer_from_topic_follow_up(query, session)
         if follow_topic is not None:
-            answer = _generate_answer(f"{session.last_topic_question} {query}", follow_topic, [follow_topic], use_llm=req.use_llm)
+            # Image follow-up: return attachments
+            is_image_req = _is_image_follow_up(query)
+            follow_attachments: list[Attachment] = []
+            if is_image_req:
+                follow_attachments = _build_attachments_for_topic(follow_topic)
+                # Also check health-check topic
+                raw_cat = str(follow_topic.category or "").strip()
+                canonical_cat = _canonical_category_for_candidate(follow_topic, follow_topic.question) or raw_cat
+                if canonical_cat in {"ตรวจสุขภาพรายบุคคล", "ตรวจสุขภาพองค์กรและสิทธิเบิกจ่าย"} and not follow_attachments:
+                    follow_attachments = _build_health_check_attachments()
+                if follow_attachments:
+                    img_answer = "มีรูปประกอบค่ะ กดดูรูปด้านล่างได้เลย"
+                    buttons = _topic_follow_up_buttons(follow_topic)
+                    follow_category = _resolved_response_category(follow_topic, query, session.last_category) or follow_topic.category
+                    _remember(session, category=follow_category, topic=follow_topic, buttons=buttons)
+                    response = ChatResponse(
+                        route="answer",
+                        answer=img_answer,
+                        confidence=0.95,
+                        reason="image_followup_with_attachment",
+                        source_id=follow_topic.id,
+                        selected_category=follow_category,
+                        action_buttons=buttons,
+                        attachments=follow_attachments,
+                        candidates=[_to_candidate_response(follow_topic)],
+                    )
+                    return _finalize_chat_response(req, session, query, response)
+
+            # KB-FIRST: If we have a direct match and mode is kb_exact, use direct answer
+            slot_answer = _build_followup_slot_answer(follow_topic, query) if FOLLOWUP_MODE == "slot_first" else None
+            if slot_answer:
+                answer = slot_answer
+                logger.info("Slot follow-up answer returned for ID: %s", follow_topic.id)
+            elif ANSWER_MODE == "kb_exact":
+                answer = format_direct_answer(follow_topic)
+                logger.info("🎯 Session follow-up (kb_exact) → Returning direct answer for ID: %s", follow_topic.id)
+            else:
+                answer = _generate_answer(f"{session.last_topic_question} {query}", follow_topic, [follow_topic], use_llm=req.use_llm)
+
             buttons = _topic_follow_up_buttons(follow_topic)
             buttons.insert(0, session.last_topic_question or follow_topic.question)
-            _remember(session, category=follow_topic.category, topic=follow_topic, buttons=buttons)
+            follow_category = _resolved_response_category(follow_topic, query, session.last_category) or follow_topic.category
+            _remember(session, category=follow_category, topic=follow_topic, buttons=buttons)
             response = ChatResponse(
                 route="answer",
-                answer=answer + "\n\n" + build_followup_hint_text(follow_topic.category, follow_topic.question),
+                answer=answer + "\n\n" + build_followup_hint_text(follow_category, follow_topic.question),
                 confidence=0.9,
                 reason="session_follow_up_answer",
                 source_id=follow_topic.id,
-                selected_category=follow_topic.category,
+                selected_category=follow_category,
                 action_buttons=buttons[:6],
                 candidates=[_to_candidate_response(follow_topic)],
             )
@@ -1124,7 +2861,154 @@ def chat(req: ChatRequest) -> ChatResponse:
     category_browse = _category_browse_candidates(category_hint) if category_hint else []
     catalog_in_category = _catalog_search(query, category=category_hint, limit=req.top_k) if category_hint else []
     catalog_global = _catalog_search(query, category=None, limit=req.top_k)
-    best_catalog = catalog_in_category[0] if catalog_in_category else (catalog_global[0] if catalog_global else None)
+
+    if catalog_in_category and catalog_global:
+        if catalog_global[0].final_score > catalog_in_category[0].final_score + 0.15:
+            # Overrule forced category if global search has a significantly better match
+            best_catalog = catalog_global[0]
+            category_hint = best_catalog.category
+            catalog_in_category = []
+        else:
+            best_catalog = catalog_in_category[0]
+    else:
+        best_catalog = catalog_in_category[0] if catalog_in_category else (catalog_global[0] if catalog_global else None)
+
+    if best_catalog is not None and _record_type(best_catalog) == "menu_node":
+        canonical_menu_category = _resolved_response_category(best_catalog, query, category_hint) or best_catalog.category
+        if typo_source:
+            buttons = _category_action_buttons(canonical_menu_category, _category_browse_candidates(canonical_menu_category))
+            _remember(session, category=canonical_menu_category, buttons=buttons)
+            response = ChatResponse(
+                route="answer",
+                answer=build_category_overview(canonical_menu_category, buttons, corrected_from=typo_source),
+                confidence=max(round(best_catalog.final_score, 4), 0.9),
+                reason="typo_recovered_category_answer",
+                source_id=best_catalog.id,
+                selected_category=canonical_menu_category,
+                action_buttons=buttons,
+                candidates=[_to_candidate_response(best_catalog)],
+            )
+            return _finalize_chat_response(req, session, query, response)
+        buttons = _category_action_buttons(canonical_menu_category, _category_browse_candidates(canonical_menu_category))
+        _remember(session, category=canonical_menu_category, buttons=buttons)
+        response = ChatResponse(
+            route="clarify",
+            answer=build_category_overview(canonical_menu_category, buttons, corrected_from=matched_alias if matched_alias and matched_alias != canonical_menu_category else None),
+            confidence=max(round(best_catalog.final_score, 4), 0.9),
+            reason="menu_tree_navigation",
+            selected_category=canonical_menu_category,
+            clarification_options=buttons,
+            action_buttons=buttons,
+            candidates=[_to_candidate_response(best_catalog)],
+        )
+        return _finalize_chat_response(req, session, query, response)
+
+    if best_catalog is not None and _record_type(best_catalog) == "child_topic":
+        if typo_source and category_hint and _is_broad_category_query(query, category_hint):
+            buttons = _category_action_buttons(category_hint, category_browse)
+            _remember(session, category=category_hint, buttons=buttons)
+            response = ChatResponse(
+                route="answer",
+                answer=build_category_overview(category_hint, buttons, corrected_from=typo_source),
+                confidence=max(round(best_catalog.final_score, 4), 0.9),
+                reason="typo_recovered_category_answer",
+                selected_category=category_hint,
+                clarification_options=buttons,
+                action_buttons=buttons,
+                candidates=[_to_candidate_response(best_catalog)],
+            )
+            return _finalize_chat_response(req, session, query, response)
+        canonical_child_category = _resolved_response_category(best_catalog, query, category_hint) or best_catalog.category
+        child_topic_name = best_catalog.subcategory or best_catalog.question
+        child_rows = _child_topic_leaf_rows(canonical_child_category, child_topic_name)
+        scoped_leaf_candidates = []
+
+        if canonical_child_category == "ตารางแพทย์และเวลาทำการ" and child_topic_name == "ตารางแพทย์ออกตรวจ":
+            buttons = list(SCHEDULE_DEPARTMENT_MENU)
+            _remember(session, category=canonical_child_category, buttons=buttons)
+            response = ChatResponse(
+                route="clarify",
+                answer="ต้องการดูตารางแพทย์ของแผนกใดคะ",
+                confidence=max(round(best_catalog.final_score, 4), 0.9),
+                reason="schedule_department_menu_from_child_topic",
+                selected_category=canonical_child_category,
+                clarification_options=buttons,
+                action_buttons=buttons,
+                candidates=[_to_candidate_response(best_catalog)],
+            )
+            return _finalize_chat_response(req, session, query, response)
+        
+        leaf_query = query
+        exact_child_query = _looks_like_exact(query, best_catalog.question) or _looks_like_exact(query, best_catalog.subcategory or "")
+        
+        # Vaccine child topic exact mapping - preserve exact KB child topics
+        # Only apply inside the vaccine branch (วัคซีนและบริการผู้ป่วยนอก)
+        if exact_child_query and canonical_child_category == "วัคซีนและบริการผู้ป่วยนอก":
+            # Map exact child topics to preserve KB structure
+            if child_topic_name == "วัคซีน HPV":
+                leaf_query = "วัคซีนมะเร็งปากมดลูก"
+            elif child_topic_name == "วัคซีนไข้หวัดใหญ่":
+                leaf_query = "วัคซีนไข้หวัดใหญ่"
+            elif child_topic_name == "วัคซีนไวรัสตับอักเสบบี":
+                leaf_query = "วัคซีนไวรัสตับอักเสบบี"
+            elif child_topic_name == "วัคซีนบาดทะยัก/พิษสุนัขบ้า":
+                leaf_query = "วัคซีนบาดทะยัก/พิษสุนัขบ้า"
+            
+        if child_rows:
+            for r in child_rows:
+                score = _catalog_match_score(leaf_query, r, canonical_child_category)
+                if score >= 0.22:
+                    scoped_leaf_candidates.append(_record_to_candidate(r, score))
+            scoped_leaf_candidates.sort(key=lambda c: c.final_score, reverse=True)
+            scoped_leaf_candidates = scoped_leaf_candidates[:5]
+        else:
+            scoped_leaf_candidates = [
+                candidate
+                for candidate in _catalog_search(leaf_query, category=canonical_child_category, limit=5)
+                if _record_type(candidate) in {"faq_leaf", "guidance", "schedule_specific"}
+            ]
+        
+        if scoped_leaf_candidates and (exact_child_query or scoped_leaf_candidates[0].final_score >= 0.45):
+            top_leaf = scoped_leaf_candidates[0]
+            if _record_type(top_leaf) == "schedule_specific":
+                answer = _format_schedule_answer(top_leaf, day_filter=_detect_thai_day(query))
+                attachments = _build_attachments_for_topic(top_leaf)
+            elif ANSWER_MODE == "kb_exact":
+                answer = format_direct_answer(top_leaf)
+                attachments = []
+            else:
+                answer = _generate_answer(query, top_leaf, scoped_leaf_candidates[:4], use_llm=req.use_llm)
+                attachments = []
+            buttons = _topic_follow_up_buttons(top_leaf)
+            _remember(session, category=canonical_child_category, topic=top_leaf, buttons=buttons)
+            response = ChatResponse(
+                route="answer",
+                answer=answer if _record_type(top_leaf) == "schedule_specific" else answer + "\n\n" + build_followup_hint_text(top_leaf.category, top_leaf.question),
+                confidence=max(round(top_leaf.final_score, 4), 0.88),
+                reason="child_topic_leaf_resolution",
+                source_id=top_leaf.id,
+                selected_category=canonical_child_category,
+                action_buttons=buttons,
+                attachments=attachments,
+                candidates=[_to_candidate_response(c) for c in scoped_leaf_candidates[:3]],
+            )
+            return _finalize_chat_response(req, session, query, response)
+        child_topic = best_catalog.subcategory or best_catalog.question
+        buttons = _child_topic_action_buttons(best_catalog.category, child_topic)
+        child_category = _resolved_response_category(best_catalog, query, category_hint) or best_catalog.category
+        # FIX: Set last_topic_id to child topic ID so follow-up queries can bind to it
+        _remember(session, category=child_category, topic=best_catalog, buttons=buttons)
+        response = ChatResponse(
+            route="clarify",
+            answer=f"หัวข้อ {child_topic} มีรายการที่เกี่ยวข้องดังนี้\n" + "\n".join(f"- {item}" for item in buttons),
+            confidence=max(round(best_catalog.final_score, 4), 0.88),
+            reason="child_topic_navigation",
+            selected_category=child_category,
+            clarification_options=buttons,
+            action_buttons=buttons,
+            candidates=[_to_candidate_response(best_catalog)],
+        )
+        return _finalize_chat_response(req, session, query, response)
 
     ambiguous = _ambiguous_category_candidates(query)
     if ambiguous and not category_hint:
@@ -1140,12 +3024,25 @@ def chat(req: ChatRequest) -> ChatResponse:
         )
         return _finalize_chat_response(req, session, query, response)
 
-    if _is_probably_gibberish(query, matched=bool(category_hint), best_candidate=best_catalog):
+    if not category_hint and best_catalog is None and _looks_like_specific_unknown_query(query):
         response = ChatResponse(
             route="fallback",
-            answer=typo_recovery_text(typo_source) if typo_source else unclear_input_text(),
+            answer=GROUNDED_LLM_FALLBACK_TEXT,
+            confidence=0.9,
+            reason="unsupported_specific_query",
+            action_buttons=list(MAIN_THEME_BUTTONS),
+            candidates=[],
+        )
+        return _finalize_chat_response(req, session, query, response)
+
+    if _is_probably_gibberish(query, matched=bool(category_hint), best_candidate=best_catalog):
+        gibberish_answer = typo_recovery_text(typo_source) if typo_source else GROUNDED_LLM_FALLBACK_TEXT
+        gibberish_reason = "unclear_input" if typo_source else "safe_unsupported_fallback"
+        response = ChatResponse(
+            route="fallback",
+            answer=gibberish_answer,
             confidence=0.92,
-            reason="unclear_input",
+            reason=gibberish_reason,
             action_buttons=GUIDE_ITEMS[:8],
             candidates=[],
         )
@@ -1154,11 +3051,13 @@ def chat(req: ChatRequest) -> ChatResponse:
     if _should_category_overview(query, category_hint, category_browse, matched_alias, best_catalog):
         buttons = _category_action_buttons(category_hint or "", category_browse)
         _remember(session, category=category_hint, buttons=buttons)
+        route_value = "clarify" if _normalize(query) == "วัคซีน" else ("answer" if typo_source else "clarify")
+        reason_value = "typo_recovered_category_answer" if typo_source else "category_overview"
         response = ChatResponse(
-            route="clarify",
-            answer=build_category_overview(category_hint or "", [c.question for c in category_browse], corrected_from=matched_alias if matched_alias and matched_alias != category_hint else None),
+            route=route_value,
+            answer=build_category_overview(category_hint or "", buttons, corrected_from=matched_alias if matched_alias and matched_alias != category_hint else None),
             confidence=round(max(alias_score, 0.76), 4),
-            reason="category_overview",
+            reason=reason_value,
             selected_category=category_hint,
             clarification_options=buttons,
             action_buttons=buttons,
@@ -1182,23 +3081,30 @@ def chat(req: ChatRequest) -> ChatResponse:
         return _finalize_chat_response(req, session, query, response)
 
     if _has_specific_match(query, best_catalog):
-        answer = _generate_answer(query, best_catalog, [best_catalog], use_llm=req.use_llm)
+        answer_category = _resolved_response_category(best_catalog, query, category_hint) or best_catalog.category
+        # KB-FIRST: If we have a direct match and mode is kb_exact, use direct answer
+        if ANSWER_MODE == "kb_exact" and best_catalog:
+            answer = format_direct_answer(best_catalog)
+            logger.info("🎯 Direct catalog match (kb_exact) → Returning direct answer for ID: %s", best_catalog.id)
+        else:
+            answer = _generate_answer(query, best_catalog, [best_catalog], use_llm=req.use_llm)
+        
         buttons = _topic_follow_up_buttons(best_catalog)
-        _remember(session, category=best_catalog.category, topic=best_catalog, buttons=buttons)
+        _remember(session, category=answer_category, topic=best_catalog, buttons=buttons)
         response = ChatResponse(
             route="answer",
-            answer=answer + "\n\n" + build_followup_hint_text(best_catalog.category, best_catalog.question),
+            answer=answer + "\n\n" + build_followup_hint_text(answer_category, best_catalog.question),
             confidence=round(best_catalog.final_score, 4),
             reason="direct_catalog_match",
             source_id=best_catalog.id,
-            selected_category=best_catalog.category,
+            selected_category=answer_category,
             action_buttons=buttons,
             candidates=[_to_candidate_response(best_catalog)],
         )
         append_audit_event(AUDIT_LOG_PATH, {"event_type": "chat", "question": query, "route": response.route, "reason": response.reason, "source_id": response.source_id})
         latency = round(time.time() - t_start, 3)
         logger.info("✅ /chat done route=%s reason=%s latency=%.3fs", response.route, response.reason, latency)
-        return response
+        return _finalize_chat_response(req, session, query, response)
 
     retrieved: list[RetrievalCandidate] = []
     if state.retriever is not None:
@@ -1215,7 +3121,7 @@ def chat(req: ChatRequest) -> ChatResponse:
         _remember(session, category=category_hint, buttons=buttons)
         response = ChatResponse(
             route="clarify",
-            answer=build_category_overview(category_hint, [c.question for c in category_browse], corrected_from=matched_alias if matched_alias and matched_alias != category_hint else None),
+            answer=build_category_overview(category_hint, buttons, corrected_from=matched_alias if matched_alias and matched_alias != category_hint else None),
             confidence=round(max(alias_score, 0.60), 4),
             reason="fallback_to_category_overview",
             selected_category=category_hint,
@@ -1226,9 +3132,10 @@ def chat(req: ChatRequest) -> ChatResponse:
         return _finalize_chat_response(req, session, query, response)
 
     if decision.action == "fallback":
+        fallback_answer = GROUNDED_LLM_FALLBACK_TEXT if not reranked and not category_hint else fallback_text()
         response = ChatResponse(
             route="fallback",
-            answer=fallback_text(),
+            answer=fallback_answer,
             confidence=decision.confidence,
             reason=decision.reason,
             warnings=decision.warnings,
@@ -1272,6 +3179,23 @@ def chat(req: ChatRequest) -> ChatResponse:
     latency = round(time.time() - t_start, 3)
     logger.info("✅ /chat done route=%s reason=%s latency=%.3fs", response.route, response.reason, latency)
     return _finalize_chat_response(req, session, query, response)
+
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest) -> ChatResponse:
+    try:
+        return _chat_impl(req)
+    except Exception as exc:
+        logger.exception("Unhandled /chat error for session=%s: %s", req.session_id[:12], exc)
+        session = state.get_session(req.session_id)
+        response = ChatResponse(
+            route="fallback",
+            answer=GROUNDED_LLM_FALLBACK_TEXT,
+            confidence=0.0,
+            reason="chat_unhandled_exception",
+            action_buttons=list(MAIN_THEME_BUTTONS),
+        )
+        return _finalize_chat_response(req, session, req.question or req.message or "", response)
 
 
 # ── Admin routes ──────────────────────────────────────────────────────────────
@@ -1388,6 +3312,18 @@ def chat_session_events(session_id: str = Query(...), after_id: int = Query(0, g
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 
+@app.post("/chat/reset-session")
+def reset_session(body: dict) -> dict[str, Any]:
+    """Explicit session reset endpoint for frontend goHome actions.
+
+    Accepts JSON body: {"session_id": "session-..."}
+    """
+    session_id = str(body.get("session_id") or "")
+    if not session_id:
+        return {"ok": False, "error": "missing session_id"}
+    session = state.get_session(session_id)
+    session.reset_context()
+    return {"ok": True, "message": "session reset", "action_buttons": list(MAIN_THEME_BUTTONS), "welcome": WELCOME_MESSAGE}
 @app.post("/admin/upload-workbook")
 async def upload_workbook(file: UploadFile = File(...), principal: AdminPrincipal = Depends(require_role("editor"))) -> dict[str, Any]:
     WORKBOOK_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1441,27 +3377,39 @@ def admin_run_evaluation(principal: AdminPrincipal = Depends(require_role("edito
     return json.loads(report_path.read_text(encoding="utf-8"))
 
 
-# ── Static UI Routes ─────────────────────────────────────────────────────────
+# ── Static Asset Endpoints (safe file serving) ───────────────────────────
+@app.get("/assets/schedule/{filename}")
+def serve_schedule_asset(filename: str) -> FileResponse:
+    """Serve schedule images from the schedule image directory."""
+    root = SCHEDULE_IMAGE_DIR
+    if not root.exists():
+        raise HTTPException(status_code=404, detail="Schedule image directory not found")
+    file_path = (root / filename).resolve()
+    # Security: must stay inside root
+    try:
+        file_path.relative_to(root.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Path traversal not allowed")
+    if file_path.suffix.lower() not in ALLOWED_ASSET_EXTENSIONS:
+        raise HTTPException(status_code=403, detail="File type not allowed")
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail=f"File not found: {filename}")
+    return FileResponse(str(file_path))
 
-@app.get("/admin-ui")
-def get_admin_ui():
-    """Serves the static admin.html console."""
-    admin_path = FRONTEND_DIR / "admin.html"
-    if not admin_path.exists():
-        raise HTTPException(status_code=404, detail="admin.html not found")
-    return FileResponse(admin_path)
 
-
-@app.get("/guide")
-def get_guide():
-    """Serves the static index.html or guide page."""
-    guide_path = FRONTEND_DIR / "index.html"
-    if not guide_path.exists():
-        raise HTTPException(status_code=404, detail="index.html not found")
-    return FileResponse(guide_path)
-
-
-@app.get("/")
-def get_root():
-    """Simple root redirect or status message."""
-    return {"status": "UP Hospital Chatbot API", "version": "20.0.0", "admin_ui": "/admin-ui"}
+@app.get("/assets/health-check/{filename}")
+def serve_health_check_asset(filename: str) -> FileResponse:
+    """Serve health check images from the health check image directory."""
+    root = HEALTH_CHECK_IMAGE_DIR
+    if not root.exists():
+        raise HTTPException(status_code=404, detail="Health check image directory not found")
+    file_path = (root / filename).resolve()
+    try:
+        file_path.relative_to(root.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Path traversal not allowed")
+    if file_path.suffix.lower() not in ALLOWED_ASSET_EXTENSIONS:
+        raise HTTPException(status_code=403, detail="File type not allowed")
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail=f"File not found: {filename}")
+    return FileResponse(str(file_path))

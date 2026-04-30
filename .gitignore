@@ -1,13 +1,71 @@
-.env
+# Python env/cache
 .venv/
 .venv-train/
 __pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node / Next.js
 node_modules/
 .next/
-artifacts/
-hf_cache/
-ollama_models/
+out/
+dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+hospital_chatbot/nextjs_frontend/.env.local
+*.key
+*.pem
+*.crt
+
+# Local DB / logs / runtime
+hospital_chatbot/data/chatbot_analytics.db
+hospital_chatbot/data/*.db
+hospital_chatbot/logs/
+*.log
+backend_*.log
+backend_*.err.log
+frontend_*.log
+
+# Model / training artifacts
+hospital_chatbot/training/uph_lora_v*/
+hospital_chatbot/training/uph_merged_v*/
+hospital_chatbot/training/*.gguf
+hospital_chatbot/training/*.safetensors
+hospital_chatbot/training/**/*.safetensors
+hospital_chatbot/training/**/checkpoint*/
+hospital_chatbot/training/merge_lora_qwen25_3b.py.bak
+
+# Generated reports / temporary
+hospital_chatbot/reports/
+hospital_chatbot/artifacts/
+hospital_chatbot/backups/
+hospital_chatbot/tmp/
+hospital_chatbot/tmp_*
+hospital_chatbot/test_*.json
+hospital_chatbot/test_*.csv
+hospital_chatbot/test_*.txt
+hospital_chatbot/*_results.json
+
+# Local vector/model stores
 chroma_db/
-*.gguf
-*.safetensors
-*.xlsx
+hospital_chatbot/chroma_db/
+OllamaModels/
+models/
+
+# Personal/dev tools
+.claude/
+.vscode/
+.idea/
+CLAUDE.md
+
+# OS
+.DS_Store
+Thumbs.db

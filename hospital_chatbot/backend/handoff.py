@@ -61,6 +61,38 @@ def _init_handoff_tables(db_path: Path) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_handoff_messages_ticket ON handoff_messages(ticket_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_handoff_messages_session ON handoff_messages(session_id)")
         conn.commit()
+        # Ensure older DBs get required columns (migration safety)
+        def _has_column(table: str, col: str) -> bool:
+            cur = conn.execute(f"PRAGMA table_info({table})")
+            return any(r[1] == col for r in cur.fetchall())
+
+        # handoff_tickets required columns
+        tickets_extra = {
+            'admin_response_text': 'TEXT',
+            'admin_responder': 'TEXT',
+            'assigned_to': 'TEXT',
+            'takeover_started_at': 'TEXT',
+            'closed_at': 'TEXT',
+            'candidate_ids_json': 'TEXT',
+        }
+        for c, typ in tickets_extra.items():
+            if not _has_column('handoff_tickets', c):
+                try:
+                    conn.execute(f"ALTER TABLE handoff_tickets ADD COLUMN {c} {typ}")
+                except Exception:
+                    pass
+
+        # handoff_messages required columns
+        messages_extra = {
+            'close_ticket': 'INTEGER',
+        }
+        for c, typ in messages_extra.items():
+            if not _has_column('handoff_messages', c):
+                try:
+                    conn.execute(f"ALTER TABLE handoff_messages ADD COLUMN {c} {typ} DEFAULT 0")
+                except Exception:
+                    pass
+        conn.commit()
 
 
 def create_handoff_ticket(

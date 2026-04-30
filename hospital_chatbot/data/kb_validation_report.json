@@ -1,5 +1,125 @@
 {
-  "record_count": 38,
-  "issue_count": 0,
-  "issues": []
+  "record_count": 111,
+  "issue_count": 17,
+  "issues": [
+    {
+      "level": "warning",
+      "sheet": "QA OPD",
+      "row_number": 10,
+      "field": "question",
+      "message": "Duplicate question within category"
+    },
+    {
+      "level": "warning",
+      "sheet": "QA OPD",
+      "row_number": 11,
+      "field": "question",
+      "message": "Duplicate question within category"
+    },
+    {
+      "level": "warning",
+      "sheet": "QA ธนาคารเลือด",
+      "row_number": 2,
+      "field": "question",
+      "message": "Duplicate question within category"
+    },
+    {
+      "level": "warning",
+      "sheet": "QA ธนาคารเลือด",
+      "row_number": 3,
+      "field": "question",
+      "message": "Duplicate question within category"
+    },
+    {
+      "level": "warning",
+      "sheet": "QA ธนาคารเลือด",
+      "row_number": 4,
+      "field": "question",
+      "message": "Duplicate question within category"
+    },
+    {
+      "level": "warning",
+      "sheet": "QA งานบุคคล",
+      "row_number": 2,
+      "field": "question",
+      "message": "Duplicate question within category"
+    },
+    {
+      "level": "warning",
+      "sheet": "QA ไตเทียม",
+      "row_number": 2,
+      "field": "question",
+      "message": "Duplicate question within category"
+    },
+    {
+      "level": "warning",
+      "sheet": "QA ไตเทียม",
+      "row_number": 3,
+      "field": "question",
+      "message": "Duplicate question within category"
+    },
+    {
+      "level": "warning",
+      "sheet": "QA ทันตกรรม",
+      "row_number": 2,
+      "field": "question",
+      "message": "Duplicate question within category"
+    },
+    {
+      "level": "warning",
+      "sheet": "QA OPD",
+      "row_number": 3,
+      "field": "question",
+      "message": "Duplicate question within category"
+    },
+    {
+      "level": "warning",
+      "sheet": "แพทย์ออกตรวจ OPD",
+      "row_number": 12,
+      "field": "question",
+      "message": "Duplicate question within category"
+    },
+    {
+      "level": "warning",
+      "sheet": "แพทย์ออกตรวจ OPD",
+      "row_number": 19,
+      "field": "question",
+      "message": "Duplicate question within category"
+    },
+    {
+      "level": "warning",
+      "sheet": "แพทย์ออกตรวจ OPD",
+      "row_number": 38,
+      "field": "question",
+      "message": "Duplicate question within category"
+    },
+    {
+      "level": "warning",
+      "sheet": "Total QA",
+      "row_number": 2,
+      "field": "question",
+      "message": "Duplicate question within category"
+    },
+    {
+      "level": "warning",
+      "sheet": "QA OPD",
+      "row_number": 4,
+      "field": "question",
+      "message": "Duplicate question within category"
+    },
+    {
+      "level": "warning",
+      "sheet": "QA OPD",
+      "row_number": 12,
+      "field": "question",
+      "message": "Duplicate question within category"
+    },
+    {
+      "level": "warning",
+      "sheet": "QA OPD",
+      "row_number": 8,
+      "field": "question",
+      "message": "Duplicate question within category"
+    }
+  ]
 }

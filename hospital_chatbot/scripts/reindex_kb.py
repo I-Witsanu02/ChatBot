@@ -78,26 +78,22 @@ def main() -> None:
     ids, documents, metadatas = [], [], []
     for row in rows:
         ids.append(str(row["id"]))
-        documents.append(f"{row.get('question', '')}\n{row.get('answer', '')}")
-        metadatas.append(
-            sanitize_metadata(
-                {
-                    "id": row.get("id", ""),
-                    "category": row.get("category", ""),
-                    "subcategory": row.get("subcategory", ""),
-                    "question": row.get("question", ""),
-                    "answer": row.get("answer", ""),
-                    "notes": row.get("notes", ""),
-                    "department": row.get("department", ""),
-                    "contact": row.get("contact", ""),
-                    "last_updated_at": row.get("last_updated_at", ""),
-                    "status": row.get("status", "active"),
-                    "requires_clarification": bool(row.get("requires_clarification", False)),
-                    "source_sheet": row.get("source_sheet", ""),
-                    "source_row": row.get("source_row", 0),
-                }
-            )
+        documents.append(
+            "\n".join(
+                [
+                    str(row.get("question", "")),
+                    str(row.get("answer", "")),
+                    str(row.get("note", "") or row.get("notes", "")),
+                    " ".join(str(v) for v in row.get("aliases", []) or []),
+                    " ".join(str(v) for v in row.get("keywords", []) or []),
+                    str(row.get("subcategory", "")),
+                    str(row.get("topic", "")),
+                ]
+            ).strip()
         )
+        metadata = dict(row)
+        metadata["requires_clarification"] = bool(row.get("requires_clarification", False))
+        metadatas.append(sanitize_metadata(metadata))
     if ids:
         collection.add(ids=ids, documents=documents, metadatas=metadatas)
     print(

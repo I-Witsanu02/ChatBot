@@ -10,7 +10,7 @@ from .retrieval import RetrievalCandidate
 
 EMERGENCY_RE = re.compile(r"แน่นหน้าอก|หายใจไม่ออก|หมดสติ|ชัก|ฉุกเฉิน|1669", re.IGNORECASE)
 OUT_OF_SCOPE_RE = re.compile(r"วินิจฉัย|สั่งยา|กินยาอะไร|รักษาหายไหม|โรคนี้อันตรายไหม", re.IGNORECASE)
-BROAD_RE = re.compile(r"^(ราคา|ค่าใช้จ่าย|วัคซีน|นัดหมาย|ตรวจสุขภาพ|ตารางแพทย์|ไวรัสตับ|สิทธิ|เอกสาร)$")
+BROAD_RE = re.compile(r"^(ราคา|ค่าใช้จ่าย|วัคซีน|นัดหมาย|ตรวจสุขภาพ|ตารางแพทย์|ไวรัสตับ|สิทธิ|เอกสาร|บริจาค|ฟอก)$")
 
 
 @dataclass(slots=True)

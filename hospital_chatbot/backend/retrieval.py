@@ -99,12 +99,43 @@ class ChromaRetriever:
 
     def search(self, query: str, top_k: int = 10, category: str | None = None) -> list[RetrievalCandidate]:
         where = {"category": category} if category else None
-        result = self._collection.query(
-            query_texts=[query],
-            n_results=top_k,
-            where=where,
-            include=["metadatas", "distances", "documents"],
-        )
+        # Support multiple embedding provider interfaces:
+        # - embedding_fn.embed_query(query)
+        # - embedding_fn([texts]) or embedding_fn(query)
+        emb: list[float] | None = None
+        try:
+            if hasattr(self._embedding_fn, "embed_query") and callable(getattr(self._embedding_fn, "embed_query")):
+                emb = self._embedding_fn.embed_query(query)
+            elif callable(self._embedding_fn):
+                # Prefer list-input style which returns list[list[float]]
+                try:
+                    out = self._embedding_fn([query])
+                    if isinstance(out, list) and out:
+                        # If provider returns [[...]]
+                        emb = out[0]
+                    else:
+                        # fallback to single-call
+                        emb = self._embedding_fn(query)
+                except TypeError:
+                    # Some callables expect a single string
+                    emb = self._embedding_fn(query)
+        except Exception:
+            emb = None
+
+        if emb:
+            result = self._collection.query(
+                query_embeddings=[emb],
+                n_results=top_k,
+                where=where,
+                include=["metadatas", "distances", "documents"],
+            )
+        else:
+            result = self._collection.query(
+                query_texts=[query],
+                n_results=top_k,
+                where=where,
+                include=["metadatas", "distances", "documents"],
+            )
         ids = result.get("ids", [[]])[0]
         metadatas = result.get("metadatas", [[]])[0]
         distances = result.get("distances", [[]])[0]
@@ -112,6 +143,13 @@ class ChromaRetriever:
         out: list[RetrievalCandidate] = []
         for item_id, meta, dist, document in zip(ids, metadatas, distances, documents):
             meta = meta or {}
+            
+            # CRITICAL FIX: Filter out menu/navigation records that aren't actual Q&A entries
+            # menu_node and child_topic are used for navigation/clarification, not as final answers
+            record_type = meta.get("record_type", "faq_leaf")
+            if record_type in ("menu_node", "child_topic"):
+                continue  # Skip menu records; they'll be used for clarification if needed
+            
             vector_score = max(0.0, 1.0 - float(dist or 0.0))
             keyword_score = _keyword_overlap(query, f"{meta.get('question','')} {document or ''}")
             candidate = RetrievalCandidate(

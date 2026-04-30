@@ -18,10 +18,10 @@ from backend.rerank import HybridReranker
 from backend.retrieval import ChromaRetriever
 from backend.versioning import load_manifest, now_bangkok_iso
 
-DEFAULT_TEST_SET = "regression_test_set_realistic.jsonl"
-DEFAULT_REPORT = "evaluation_report.json"
-DEFAULT_DETAILS = "evaluation_details.jsonl"
-DEFAULT_MANIFEST = "kb_manifest.json"
+DEFAULT_TEST_SET = "data/regression_test_set_comprehensive.jsonl"
+DEFAULT_REPORT = "data/evaluation_report_comprehensive.json"
+DEFAULT_DETAILS = "data/evaluation_details_comprehensive.jsonl"
+DEFAULT_MANIFEST = "data/kb_manifest.json"
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -62,8 +62,11 @@ def main() -> None:
     source_correct = 0
     details: list[dict[str, Any]] = []
     by_case_type: dict[str, dict[str, int]] = {}
+    print(f"Starting evaluation on {len(tests)} cases...")
 
-    for case in tests:
+    for i, case in enumerate(tests):
+        if (i + 1) % 10 == 0 or i == 0:
+            print(f"   [{i + 1}/{len(tests)}] Processing...")
         query = case["question"]
         expected_route = case.get("expected_route")
         expected_source_id = case.get("expected_source_id")
