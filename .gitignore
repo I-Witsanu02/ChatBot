@@ -3,6 +3,8 @@
 .venv-train/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
@@ -21,9 +23,11 @@ yarn-error.log*
 .env.*
 !.env.example
 hospital_chatbot/nextjs_frontend/.env.local
+nextjs_frontend/.env.local
 *.key
 *.pem
 *.crt
+cert.pem
 
 # Local DB / logs / runtime
 hospital_chatbot/data/chatbot_analytics.db
@@ -35,24 +39,29 @@ backend_*.err.log
 frontend_*.log
 
 # Model / training artifacts
+*.gguf
+*.safetensors
+*.bin
 hospital_chatbot/training/uph_lora_v*/
 hospital_chatbot/training/uph_merged_v*/
+hospital_chatbot/training/**/checkpoint*/
+hospital_chatbot/training/checkpoint*/
 hospital_chatbot/training/*.gguf
 hospital_chatbot/training/*.safetensors
 hospital_chatbot/training/**/*.safetensors
-hospital_chatbot/training/**/checkpoint*/
-hospital_chatbot/training/merge_lora_qwen25_3b.py.bak
 
-# Generated reports / temporary
+# Generated reports/results
 hospital_chatbot/reports/
 hospital_chatbot/artifacts/
 hospital_chatbot/backups/
 hospital_chatbot/tmp/
 hospital_chatbot/tmp_*
-hospital_chatbot/test_*.json
-hospital_chatbot/test_*.csv
-hospital_chatbot/test_*.txt
-hospital_chatbot/*_results.json
+focused_runtime_regression_results.json
+hospital_chatbot/focused_runtime_regression_results.json
+regression_*.csv
+regression_*.json
+hospital_chatbot/regression_*.csv
+hospital_chatbot/regression_*.json
 
 # Local vector/model stores
 chroma_db/

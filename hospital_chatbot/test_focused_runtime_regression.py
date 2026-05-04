@@ -1,490 +1,519 @@
-"""Focused runtime regression tests for 4 specific bug fixes.
+"""Focused runtime regression tests for UPH chatbot UAT routing fixes."""
 
-Tests:
-1. Main menu fix - "นัดหมายและตารางแพทย์" exposes both child branches
-2. Follow-up binding fix - Short follow-up questions bind to current topic first
-3. "มีรูปไหม" context fix - Returns image/file if exists in current schedule topic
-4. Vaccine child mapping fix - Vaccine child topics map exactly to KB child topic
-"""
+from __future__ import annotations
 
 import json
+import sys
+from typing import Any
+
 import requests
-from typing import Any, Dict, List
+
+
+FORBIDDEN_TEXT = [
+    "D:\\",
+    "หมายเหตุ:",
+    "อัปเดตล่าสุด:",
+    "หากต้องการถามต่อเกี่ยวกับ",
+    "ไหมค่ะ",
+]
 
 
 class FocusedRuntimeRegressionTest:
-    """Test class for focused runtime regression tests."""
-
-    def __init__(self, base_url: str = "http://127.0.0.1:8000"):
-        self.base_url = base_url
-        self.session_id = "test_focused_regression"
-        self.results: List[Dict[str, Any]] = []
+    def __init__(self, base_url: str = "http://127.0.0.1:8000") -> None:
+        self.base_url = base_url.rstrip("/")
+        self.session_id = "test_focused_regression_v3"
+        self.results: list[dict[str, Any]] = []
 
     def reset_session(self) -> None:
-        """Reset the test session."""
         try:
-            requests.post(f"{self.base_url}/chat/reset-session", json={"session_id": self.session_id})
-        except Exception as e:
-            print(f"Warning: Could not reset session: {e}")
+            requests.post(
+                f"{self.base_url}/chat/reset-session",
+                json={"session_id": self.session_id},
+                timeout=15,
+            )
+        except Exception as exc:  # pragma: no cover
+            print(f"Warning: could not reset session: {exc}")
 
-    def chat(self, question: str) -> Dict[str, Any]:
-        """Send a chat request and return the response."""
-        payload = {
-            "question": question,
-            "session_id": self.session_id,
-            "use_llm": False,
-            "top_k": 10
-        }
-        response = requests.post(f"{self.base_url}/chat", json=payload)
+    def chat(self, question: str) -> dict[str, Any]:
+        response = requests.post(
+            f"{self.base_url}/chat",
+            json={
+                "question": question,
+                "session_id": self.session_id,
+                "use_llm": False,
+                "top_k": 10,
+            },
+            timeout=45,
+        )
         response.raise_for_status()
         return response.json()
 
-    def record_result(self, test_name: str, query: str, expected: str, actual: str, passed: bool, details: str = "") -> None:
-        """Record a test result."""
-        self.results.append({
-            "test_name": test_name,
-            "query": query,
-            "expected": expected,
-            "actual": actual,
-            "passed": passed,
-            "details": details
-        })
+    def record(self, name: str, query: str, passed: bool, details: str) -> None:
+        self.results.append(
+            {
+                "test_name": name,
+                "query": query,
+                "passed": bool(passed),
+                "details": details,
+            }
+        )
+        print(f"{name}: {'PASS' if passed else 'FAIL'}")
 
-    def run_test_group_a_main_menu(self) -> None:
-        """Test Group A: Main menu / child tree."""
-        print("\n=== Group A: Main menu / child tree ===")
+    def _attachment_urls(self, response: dict[str, Any]) -> list[str]:
+        return [str(item.get("url") or "") for item in response.get("attachments") or []]
 
-        # Test A1: "นัดหมายและตารางแพทย์" should expose both child branches
+    def _assert_no_leakage(self, answer: str) -> tuple[bool, list[str]]:
+        found = [token for token in FORBIDDEN_TEXT if token in answer]
+        return (not found), found
+
+    def run_health_program_test(self) -> None:
         self.reset_session()
-        response = self.chat("นัดหมายและตารางแพทย์")
-        buttons = response.get("action_buttons", [])
-        
-        # Check that both child branches are present
-        has_appointment = any("การจัดการนัดหมาย" in b or "นัด" in b for b in buttons)
-        has_schedule = any("ตารางแพทย์" in b or "เวลาทำการ" in b for b in buttons)
-        
-        passed = has_appointment and has_schedule
-        self.record_result(
-            "A1_MainMenuBothBranches",
-            "นัดหมายและตารางแพทย์",
-            "Both การจัดการนัดหมาย and ตารางแพทย์และเวลาทำการ in buttons",
-            f"Buttons: {buttons}",
+        response = self.chat("โปรแกรมตรวจสุขภาพ")
+        answer = str(response.get("answer") or "")
+        urls = self._attachment_urls(response)
+        expected_urls = {
+            "/assets/health-check/โปรแกรมตรวจสุขภาพ.jpg",
+            "/assets/health-check/โปรแกรมตรวจสุขภาพ 2.jpg",
+            "/assets/health-check/ไลน์ Check-up.jpg",
+        }
+        no_leakage, found = self._assert_no_leakage(answer)
+        passed = (
+            "054 466 666 ต่อ 7173" in answer
+            and "08.00-16.00" in answer
+            and expected_urls.issubset(set(urls))
+            and len(urls) == len(set(urls))
+            and no_leakage
+            and "054 466 666 ต่อ 7173\n054 466 666 ต่อ 7173" not in answer
+        )
+        self.record(
+            "HC_Program",
+            "โปรแกรมตรวจสุขภาพ",
             passed,
-            f"Has appointment branch: {has_appointment}, Has schedule branch: {has_schedule}"
+            f"answer={answer!r}, urls={urls}, forbidden={found}",
         )
-        print(f"A1. Main menu both branches: {'PASS' if passed else 'FAIL'}")
 
-        # Test A2: "ตารางแพทย์" should show schedule options
+    def run_health_hours_test(self) -> None:
         self.reset_session()
-        response = self.chat("ตารางแพทย์")
-        selected_category = response.get("selected_category", "")
-        passed = "ตารางแพทย์" in selected_category or "นัดหมายและตารางแพทย์" in selected_category
-        self.record_result(
-            "A2_ScheduleCategory",
-            "ตารางแพทย์",
-            "Category contains ตารางแพทย์ or นัดหมายและตารางแพทย์",
-            f"Category: {selected_category}",
-            passed
+        response = self.chat("เวลาตรวจสุขภาพ")
+        answer = str(response.get("answer") or "")
+        no_leakage, found = self._assert_no_leakage(answer)
+        passed = (
+            "เวลา 08.00-16.00 น." in answer
+            and "หยุดทุกวันเสาร์-อาทิตย์" in answer
+            and "ติดต่อแผนกตรวจสุขภาพ" not in answer
+            and no_leakage
         )
-        print(f"A2. Schedule category: {'PASS' if passed else 'FAIL'}")
+        self.record(
+            "HC_Hours",
+            "เวลาตรวจสุขภาพ",
+            passed,
+            f"answer={answer!r}, forbidden={found}",
+        )
 
-        # Test A3: "เวลาทำการแผนกผู้ป่วยนอก"
+    def run_health_certificate_test(self) -> None:
         self.reset_session()
-        response = self.chat("เวลาทำการแผนกผู้ป่วยนอก")
-        selected_category = response.get("selected_category", "")
-        passed = "นัดหมายและตารางแพทย์" in selected_category or "ตารางแพทย์" in selected_category
-        self.record_result(
-            "A3_OPDHours",
-            "เวลาทำการแผนกผู้ป่วยนอก",
-            "Category contains นัดหมายและตารางแพทย์ or ตารางแพทย์",
-            f"Category: {selected_category}",
-            passed
+        response = self.chat("ใบรับรองแพทย์")
+        answer = str(response.get("answer") or "")
+        no_leakage, found = self._assert_no_leakage(answer)
+        passed = (
+            "054 466 666 ต่อ 7173" in answer
+            and "08.00-16.00" in answer
+            and no_leakage
         )
-        print(f"A3. OPD hours: {'PASS' if passed else 'FAIL'}")
+        self.record(
+            "HC_Certificate",
+            "ใบรับรองแพทย์",
+            passed,
+            f"answer={answer!r}, urls={self._attachment_urls(response)}, forbidden={found}",
+        )
 
-        # Test A4: "ขอเลื่อนนัดพบแพทย์"
+    def run_schedule_eye_test(self) -> None:
+        self.reset_session()
+        response = self.chat("จักษุแพทย์ (ตา)")
+        answer = str(response.get("answer") or "")
+        urls = self._attachment_urls(response)
+        no_leakage, found = self._assert_no_leakage(answer)
+        passed = (
+            "นายแพทย์ดนัยภัทร" in answer
+            and "แพทย์หญิงชญานี" in answer
+            and "ยังไม่ระบุชื่อแพทย์ในข้อมูล" not in answer
+            and "/assets/schedule/ตา.png" in urls
+            and no_leakage
+        )
+        self.record(
+            "SCH_Eye",
+            "จักษุแพทย์ (ตา)",
+            passed,
+            f"answer={answer!r}, urls={urls}, forbidden={found}",
+        )
+
+    def run_schedule_internal_medicine_group_test(self) -> None:
+        self.reset_session()
+        response = self.chat("อายุรกรรม")
+        answer = str(response.get("answer") or "")
+        urls = self._attachment_urls(response)
+        no_leakage, found = self._assert_no_leakage(answer)
+        required_names = [
+            "แพทย์หญิงเพชราภรณ์",
+            "นายแพทย์ภาษา",
+            "แพทย์หญิงมัลลิกา",
+            "นายแพทย์พงศธร",
+        ]
+        passed = (
+            all(name in answer for name in required_names)
+            and "/assets/schedule/อายุรกรรม 1.png" in urls
+            and "/assets/schedule/อายุรกรรม 2.png" in urls
+            and no_leakage
+        )
+        self.record(
+            "SCH_InternalMed_Group",
+            "อายุรกรรม",
+            passed,
+            f"answer={answer!r}, urls={urls}, forbidden={found}",
+        )
+
+    def run_schedule_skin_test(self) -> None:
+        self.reset_session()
+        response = self.chat("ผิวหนัง")
+        answer = str(response.get("answer") or "")
+        urls = self._attachment_urls(response)
+        no_leakage, found = self._assert_no_leakage(answer)
+        passed = (
+            "แพทย์หญิงภัทรภร" in answer
+            and "นายแพทย์วสุชล" in answer
+            and "/assets/schedule/ผิวหนัง.png" in urls
+            and no_leakage
+        )
+        self.record(
+            "SCH_Skin",
+            "ผิวหนัง",
+            passed,
+            f"answer={answer!r}, urls={urls}, forbidden={found}",
+        )
+
+    def run_pediatrics_schedule_test(self) -> None:
+        self.reset_session()
+        response = self.chat("กุมารแพทย์")
+        answer = str(response.get("answer") or "")
+        urls = self._attachment_urls(response)
+        no_leakage, found = self._assert_no_leakage(answer)
+        passed = (
+            "กุมารแพทย์ (ผู้ป่วยนอก 3/OPD 3)" in answer
+            and "เพ็ญพรรณ" in answer
+            and "สรกิจ" in answer
+            and "สรัสวดี" not in answer
+            and "/assets/schedule/กุมารแพทย์.png" in urls
+            and no_leakage
+        )
+        self.record(
+            "SCH_Pediatrics",
+            "กุมารแพทย์",
+            passed,
+            f"answer={answer!r}, urls={urls}, forbidden={found}",
+        )
+
+    def run_pediatric_cardiology_schedule_test(self) -> None:
+        self.reset_session()
+        response = self.chat("กุมารแพทย์ โรคหัวใจ")
+        answer = str(response.get("answer") or "")
+        urls = self._attachment_urls(response)
+        no_leakage, found = self._assert_no_leakage(answer)
+        passed = (
+            "กุมารแพทย์ โรคหัวใจ (ผู้ป่วยนอก 3/OPD 3)" in answer
+            and "สรัสวดี" in answer
+            and "เพ็ญพรรณ" not in answer
+            and "สรกิจ" not in answer
+            and "/assets/schedule/กุมารแพทย์.png" in urls
+            and no_leakage
+        )
+        self.record(
+            "SCH_PediatricCardiology",
+            "กุมารแพทย์ โรคหัวใจ",
+            passed,
+            f"answer={answer!r}, urls={urls}, forbidden={found}",
+        )
+
+    def run_adult_cardiology_schedule_test(self) -> None:
+        self.reset_session()
+        response = self.chat("อายุรแพทย์โรคหัวใจ")
+        answer = str(response.get("answer") or "")
+        urls = self._attachment_urls(response)
+        no_leakage, found = self._assert_no_leakage(answer)
+        passed = (
+            "อายุรแพทย์โรคหัวใจ" in answer
+            and "พงศธร" in answer
+            and "สรัสวดี" not in answer
+            and "เพ็ญพรรณ" not in answer
+            and "สรกิจ" not in answer
+            and "/assets/schedule/อายุรกรรม 1.png" in urls
+            and no_leakage
+        )
+        self.record(
+            "SCH_AdultCardiology",
+            "อายุรแพทย์โรคหัวใจ",
+            passed,
+            f"answer={answer!r}, urls={urls}, forbidden={found}",
+        )
+
+    def run_doctor_name_tests(self) -> None:
+        cases = [
+            (
+                "DOC_Krittin",
+                "หมอกฤตินออกตรวจวันไหน",
+                ["นายแพทย์กฤติน นาราเวชสกุล", "ระบบทางเดินปัสสาวะ", "วันอังคาร", "08.00-12.00"],
+                "/assets/schedule/ทางเดินปัสสาวะ.png",
+            ),
+            (
+                "DOC_PacharaShort",
+                "หมอพชร วันไหน",
+                ["นายแพทย์พชรพล อุดมลักษณ์", "ศัลยแพทย์กระดูกและข้อ", "วันศุกร์", "08.00-16.00"],
+                "/assets/schedule/กระดูกและข้อ.png",
+            ),
+            (
+                "DOC_Pacharapol",
+                "พชรพล",
+                ["นายแพทย์พชรพล อุดมลักษณ์", "ศัลยแพทย์กระดูกและข้อ"],
+                "/assets/schedule/กระดูกและข้อ.png",
+            ),
+            (
+                "DOC_Nitiphumi",
+                "นิติภูมิ",
+                ["นายแพทย์นิติภูมิ สินณฐากร", "ศัลยแพทย์กระดูกและข้อ", "วันพุธ"],
+                "/assets/schedule/กระดูกและข้อ.png",
+            ),
+        ]
+        for name, query, required_parts, required_url in cases:
+            self.reset_session()
+            response = self.chat(query)
+            answer = str(response.get("answer") or "")
+            urls = self._attachment_urls(response)
+            no_leakage, found = self._assert_no_leakage(answer)
+            passed = all(part in answer for part in required_parts) and required_url in urls and no_leakage
+            self.record(
+                name,
+                query,
+                passed,
+                f"answer={answer!r}, urls={urls}, forbidden={found}",
+            )
+
+    def run_reschedule_route_test(self) -> None:
         self.reset_session()
         response = self.chat("ขอเลื่อนนัดพบแพทย์")
-        selected_category = response.get("selected_category", "")
-        passed = "การจัดการนัดหมาย" in selected_category or "นัดหมาย" in selected_category
-        self.record_result(
-            "A4_AppointmentReschedule",
-            "ขอเลื่อนนัดพบแพทย์",
-            "Category contains การจัดการนัดหมาย or นัดหมาย",
-            f"Category: {selected_category}",
-            passed
+        answer = str(response.get("answer") or "")
+        buttons = response.get("action_buttons") or []
+        urls = self._attachment_urls(response)
+        no_leakage, found = self._assert_no_leakage(answer)
+        passed = (
+            "ต่อ 7304" in answer
+            and "ต่อ 7173" in answer
+            and "ต่อ 7210" in answer
+            and "กุมารแพทย์" not in answer
+            and not urls
+            and buttons == ["การจัดการนัดหมาย", "ตารางแพทย์และเวลาทำการ", "กลับหน้าหลัก"]
+            and no_leakage
         )
-        print(f"A4. Appointment reschedule: {'PASS' if passed else 'FAIL'}")
+        self.record(
+            "UAT_Reschedule",
+            "ขอเลื่อนนัดพบแพทย์",
+            passed,
+            f"answer={answer!r}, buttons={buttons}, urls={urls}, forbidden={found}",
+        )
 
-    def run_test_group_b_followup_binding(self) -> None:
-        """Test Group B: Follow-up binding."""
-        print("\n=== Group B: Follow-up binding ===")
-
-        # Test B1: Follow-up should bind to current topic (ติดต่อที่ไหน)
+    def run_mental_health_specialty_test(self) -> None:
         self.reset_session()
-        try:
-            response1 = self.chat("นัดหมายและตารางแพทย์")
-            response2 = self.chat("ขอเลื่อนนัดพบแพทย์")
-            response3 = self.chat("ติดต่อที่ไหน")
-            
-            # The follow-up should stay in the appointment context, not jump to schedule
-            selected_category = response3.get("selected_category", "") or ""
-            passed = "การจัดการนัดหมาย" in selected_category or "นัดหมาย" in selected_category
-            self.record_result(
-                "B1_FollowupContact",
-                "นัดหมายและตารางแพทย์ -> ขอเลื่อนนัดพบแพทย์ -> ติดต่อที่ไหน",
-                "Category should be การจัดการนัดหมาย (not ตารางแพทย์)",
-                f"Category: {selected_category}",
-                passed
-            )
-            print(f"B1. Follow-up contact: {'PASS' if passed else 'FAIL'}")
-        except Exception as e:
-            self.record_result(
-                "B1_FollowupContact",
-                "นัดหมายและตารางแพทย์ -> ขอเลื่อนนัดพบแพทย์ -> ติดต่อที่ไหน",
-                "Should return valid response",
-                f"Error: {e}",
-                False
-            )
-            print(f"B1. Follow-up contact: FAIL (error: {e})")
+        response = self.chat("สุขภาพจิตชุมชน")
+        answer = str(response.get("answer") or "")
+        urls = self._attachment_urls(response)
+        no_leakage, found = self._assert_no_leakage(answer)
+        passed = (
+            "เธียรชัย" in answer
+            and "สุขภาพจิตชุมชน" in answer
+            and "ภาษา สุขสอน" not in answer
+            and "/assets/schedule/เวชศาสตร์.png" in urls
+            and no_leakage
+        )
+        self.record(
+            "UAT_MentalHealth",
+            "สุขภาพจิตชุมชน",
+            passed,
+            f"answer={answer!r}, urls={urls}, forbidden={found}",
+        )
 
-        # Test B2: Follow-up should bind to current topic (เปิดวันไหน)
+    def run_checkup_schedule_test(self) -> None:
         self.reset_session()
-        try:
-            self.chat("นัดหมายและตารางแพทย์")
-            self.chat("ขอเลื่อนนัดพบแพทย์")
-            response = self.chat("เปิดวันไหน")
-            
-            selected_category = response.get("selected_category", "") or ""
-            passed = "การจัดการนัดหมาย" in selected_category or "นัดหมาย" in selected_category
-            self.record_result(
-                "B2_FollowupHours",
-                "นัดหมายและตารางแพทย์ -> ขอเลื่อนนัดพบแพทย์ -> เปิดวันไหน",
-                "Category should be การจัดการนัดหมาย (not ตารางแพทย์)",
-                f"Category: {selected_category}",
-                passed
-            )
-            print(f"B2. Follow-up hours: {'PASS' if passed else 'FAIL'}")
-        except Exception as e:
-            self.record_result(
-                "B2_FollowupHours",
-                "นัดหมายและตารางแพทย์ -> ขอเลื่อนนัดพบแพทย์ -> เปิดวันไหน",
-                "Should return valid response",
-                f"Error: {e}",
-                False
-            )
-            print(f"B2. Follow-up hours: FAIL (error: {e})")
+        response = self.chat("ตรวจสุขภาพ")
+        answer = str(response.get("answer") or "")
+        urls = self._attachment_urls(response)
+        no_leakage, found = self._assert_no_leakage(answer)
+        passed = (
+            "ตรวจสุขภาพ (ผู้ป่วยนอก 2/OPD 2)" in answer
+            and "ชนกนันท์" in answer
+            and "อชิรญา" in answer
+            and "ภาษา สุขสอน" not in answer
+            and "/assets/schedule/เวชศาสตร์.png" in urls
+            and no_leakage
+        )
+        self.record(
+            "UAT_CheckupSchedule",
+            "ตรวจสุขภาพ",
+            passed,
+            f"answer={answer!r}, urls={urls}, forbidden={found}",
+        )
 
-        # Test B3: Follow-up "มีรูปไหม" should not switch category
+    def run_elderly_specialty_test(self) -> None:
         self.reset_session()
-        try:
-            self.chat("นัดหมายและตารางแพทย์")
-            self.chat("ขอเลื่อนนัดพบแพทย์")
-            response = self.chat("มีรูปไหม")
-            
-            selected_category = response.get("selected_category", "") or ""
-            passed = "การจัดการนัดหมาย" in selected_category or "นัดหมาย" in selected_category
-            self.record_result(
-                "B3_FollowupImage",
-                "นัดหมายและตารางแพทย์ -> ขอเลื่อนนัดพบแพทย์ -> มีรูปไหม",
-                "Category should be การจัดการนัดหมาย (not ตารางแพทย์)",
-                f"Category: {selected_category}",
-                passed
-            )
-            print(f"B3. Follow-up image: {'PASS' if passed else 'FAIL'}")
-        except Exception as e:
-            self.record_result(
-                "B3_FollowupImage",
-                "นัดหมายและตารางแพทย์ -> ขอเลื่อนนัดพบแพทย์ -> มีรูปไหม",
-                "Should return valid response",
-                f"Error: {e}",
-                False
-            )
-            print(f"B3. Follow-up image: FAIL (error: {e})")
+        response = self.chat("อายุรแพทย์ผู้สูงอายุ")
+        answer = str(response.get("answer") or "")
+        urls = self._attachment_urls(response)
+        no_leakage, found = self._assert_no_leakage(answer)
+        passed = (
+            "อายุรแพทย์คลินิกผู้สูงอายุ" in answer
+            and "ภาษา สุขสอน" in answer
+            and all(name not in answer for name in ["มัลลิกา", "กานต์ธิรา", "พงศธร"])
+            and "/assets/schedule/อายุรกรรม 1.png" in urls
+            and no_leakage
+        )
+        self.record(
+            "UAT_ElderlySpecialty",
+            "อายุรแพทย์ผู้สูงอายุ",
+            passed,
+            f"answer={answer!r}, urls={urls}, forbidden={found}",
+        )
 
-    def run_test_group_c_schedule_image_context(self) -> None:
-        """Test Group C: Schedule image context."""
-        print("\n=== Group C: Schedule image context ===")
-
-        # Test C1: Schedule topic with "มีรูปไหม" should check current topic
+    def run_cancer_specialty_test(self) -> None:
         self.reset_session()
-        try:
-            self.chat("ตารางแพทย์ออกตรวจ")
-            self.chat("จักษุแพทย์ (ตา)")
-            response = self.chat("มีรูปไหม")
-            
-            # Tighten: Must explicitly mention image/file/link OR say no image available
-            # Generic greeting/menu response should NOT count as PASS
-            answer = response.get("answer", "").lower() or ""
-            selected_category = response.get("selected_category", "") or ""
-            
-            # Check for explicit image-related mentions
-            has_image_mention = any(phrase in answer for phrase in ["รูป", "ภาพ", "ไฟล์", "ลิงก์", "link"])
-            has_no_image = "ไม่มี" in answer and ("รูป" in answer or "ภาพ" in answer or "ไฟล์" in answer)
-            
-            # Check that it doesn't jump to wrong category (should stay in schedule-related category)
-            correct_category = "ตารางแพทย์" in selected_category or "จักษุ" in selected_category or "ตา" in selected_category
-            
-            passed = (has_image_mention or has_no_image) and correct_category
-            self.record_result(
-                "C1_ScheduleImageEye",
-                "ตารางแพทย์ออกตรวจ -> จักษุแพทย์ (ตา) -> มีรูปไหม",
-                "Must explicitly mention image/file/link OR say no image, AND stay in correct category",
-                f"Answer: {answer[:100]}, Category: {selected_category}",
-                passed
-            )
-            print(f"C1. Schedule image (eye): {'PASS' if passed else 'FAIL'}")
-        except Exception as e:
-            self.record_result(
-                "C1_ScheduleImageEye",
-                "ตารางแพทย์ออกตรวจ -> จักษุแพทย์ (ตา) -> มีรูปไหม",
-                "Should return valid response",
-                f"Error: {e}",
-                False
-            )
-            print(f"C1. Schedule image (eye): FAIL (error: {e})")
+        response = self.chat("อายุรแพทย์มะเร็งวิทยา")
+        answer = str(response.get("answer") or "")
+        urls = self._attachment_urls(response)
+        no_leakage, found = self._assert_no_leakage(answer)
+        passed = (
+            "อายุรแพทย์มะเร็งวิทยา" in answer
+            and "มัลลิกา" in answer
+            and all(name not in answer for name in ["ภาษา สุขสอน", "กานต์ธิรา", "พงศธร"])
+            and "/assets/schedule/อายุรกรรม 1.png" in urls
+            and no_leakage
+        )
+        self.record(
+            "UAT_CancerSpecialty",
+            "อายุรแพทย์มะเร็งวิทยา",
+            passed,
+            f"answer={answer!r}, urls={urls}, forbidden={found}",
+        )
 
-        # Test C2: Another schedule topic
+    def run_neuro_specialty_test(self) -> None:
         self.reset_session()
-        try:
-            self.chat("ตารางแพทย์")
-            self.chat("หมอตาวันนี้มีไหม")
-            response = self.chat("มีรูปไหม")
-            
-            answer = response.get("answer", "").lower() or ""
-            selected_category = response.get("selected_category", "") or ""
-            
-            has_image_mention = any(phrase in answer for phrase in ["รูป", "ภาพ", "ไฟล์", "ลิงก์", "link"])
-            has_no_image = "ไม่มี" in answer and ("รูป" in answer or "ภาพ" in answer or "ไฟล์" in answer)
-            correct_category = "ตารางแพทย์" in selected_category or "จักษุ" in selected_category or "ตา" in selected_category
-            
-            passed = (has_image_mention or has_no_image) and correct_category
-            self.record_result(
-                "C2_ScheduleImageToday",
-                "ตารางแพทย์ -> หมอตาวันนี้มีไหม -> มีรูปไหม",
-                "Must explicitly mention image/file/link OR say no image, AND stay in correct category",
-                f"Answer: {answer[:100]}, Category: {selected_category}",
-                passed
-            )
-            print(f"C2. Schedule image (today): {'PASS' if passed else 'FAIL'}")
-        except Exception as e:
-            self.record_result(
-                "C2_ScheduleImageToday",
-                "ตารางแพทย์ -> หมอตาวันนี้มีไหม -> มีรูปไหม",
-                "Should return valid response",
-                f"Error: {e}",
-                False
-            )
-            print(f"C2. Schedule image (today): FAIL (error: {e})")
+        response = self.chat("ระบบประสาทและสมอง")
+        answer = str(response.get("answer") or "")
+        urls = self._attachment_urls(response)
+        no_leakage, found = self._assert_no_leakage(answer)
+        passed = (
+            "ระบบประสาทและสมอง" in answer
+            and "จิตราภรณ์" in answer
+            and "วัชเรสร" in answer
+            and "ภาษา สุขสอน" not in answer
+            and "/assets/schedule/อายุรกรรม 1.png" in urls
+            and "/assets/schedule/อายุรกรรม 2.png" in urls
+            and no_leakage
+        )
+        self.record(
+            "UAT_NeuroSpecialty",
+            "ระบบประสาทและสมอง",
+            passed,
+            f"answer={answer!r}, urls={urls}, forbidden={found}",
+        )
 
-        # Test C3: Orthopedic schedule
+    def run_ortho_rehab_specialty_test(self) -> None:
         self.reset_session()
-        try:
-            self.chat("ตารางแพทย์")
-            self.chat("หมอกระดูกออกวันไหน")
-            response = self.chat("มีรูปไหม")
-            
-            answer = response.get("answer", "").lower() or ""
-            selected_category = response.get("selected_category", "") or ""
-            
-            has_image_mention = any(phrase in answer for phrase in ["รูป", "ภาพ", "ไฟล์", "ลิงก์", "link"])
-            has_no_image = "ไม่มี" in answer and ("รูป" in answer or "ภาพ" in answer or "ไฟล์" in answer)
-            correct_category = "ตารางแพทย์" in selected_category or "กระดูก" in selected_category or "ศัลยศาสตร์" in selected_category
-            
-            passed = (has_image_mention or has_no_image) and correct_category
-            self.record_result(
-                "C3_ScheduleImageBone",
-                "ตารางแพทย์ -> หมอกระดูกออกวันไหน -> มีรูปไหม",
-                "Must explicitly mention image/file/link OR say no image, AND stay in correct category",
-                f"Answer: {answer[:100]}, Category: {selected_category}",
-                passed
-            )
-            print(f"C3. Schedule image (bone): {'PASS' if passed else 'FAIL'}")
-        except Exception as e:
-            self.record_result(
-                "C3_ScheduleImageBone",
-                "ตารางแพทย์ -> หมอกระดูกออกวันไหน -> มีรูปไหม",
-                "Should return valid response",
-                f"Error: {e}",
-                False
-            )
-            print(f"C3. Schedule image (bone): FAIL (error: {e})")
+        response = self.chat("ออร์โธปิดิคส์บูรณสภาพ")
+        answer = str(response.get("answer") or "")
+        urls = self._attachment_urls(response)
+        no_leakage, found = self._assert_no_leakage(answer)
+        passed = (
+            "ออร์โธปิดิคส์บูรณสภาพ" in answer
+            and "ฐิตินันท์" in answer
+            and "พชรพล" not in answer
+            and "/assets/schedule/กระดูกและข้อ.png" in urls
+            and no_leakage
+        )
+        self.record(
+            "UAT_OrthoRehab",
+            "ออร์โธปิดิคส์บูรณสภาพ",
+            passed,
+            f"answer={answer!r}, urls={urls}, forbidden={found}",
+        )
 
-    def run_test_group_d_vaccine_child_mapping(self) -> None:
-        """Test Group D: Vaccine exact child mapping."""
-        print("\n=== Group D: Vaccine exact child mapping ===")
-
-        # Test D1: HPV vaccine
+    def run_opd_hours_route_test(self) -> None:
         self.reset_session()
-        try:
-            response = self.chat("วัคซีน")
-            buttons = response.get("action_buttons", []) or []
-            
-            # Check that HPV is available as a child option
-            has_hpv = any("hpv" in b.lower() or "มะเร็งปากมดลูก" in b for b in buttons)
-            self.record_result(
-                "D1_VaccineHPV",
-                "วัคซีน",
-                "HPV/มะเร็งปากมดลูก should be in child options",
-                f"Buttons: {buttons}",
-                has_hpv
-            )
-            print(f"D1. Vaccine HPV: {'PASS' if has_hpv else 'FAIL'}")
-        except Exception as e:
-            self.record_result(
-                "D1_VaccineHPV",
-                "วัคซีน",
-                "Should return valid response",
-                f"Error: {e}",
-                False
-            )
-            print(f"D1. Vaccine HPV: FAIL (error: {e})")
+        response = self.chat("เวลาทำการแผนกผู้ป่วยนอก")
+        answer = str(response.get("answer") or "")
+        no_leakage, found = self._assert_no_leakage(answer)
+        passed = (
+            "08.00-16.00" in answer
+            and "16.00-20.00" in answer
+            and "ฉุกเฉินเปิดบริการ 24 ชั่วโมง" in answer
+            and "ต้องการทราบตารางแพทย์" not in answer
+            and no_leakage
+        )
+        self.record(
+            "UAT_OPDHours",
+            "เวลาทำการแผนกผู้ป่วยนอก",
+            passed,
+            f"answer={answer!r}, forbidden={found}",
+        )
 
-        # Test D2: Influenza vaccine
+    def run_fallback_test(self) -> None:
         self.reset_session()
-        try:
-            response = self.chat("วัคซีน")
-            buttons = response.get("action_buttons", []) or []
-            
-            has_flu = any("ไข้หวัด" in b or "influenza" in b.lower() for b in buttons)
-            self.record_result(
-                "D2_VaccineFlu",
-                "วัคซีน",
-                "ไข้หวัด/influenza should be in child options",
-                f"Buttons: {buttons}",
-                has_flu
-            )
-            print(f"D2. Vaccine flu: {'PASS' if has_flu else 'FAIL'}")
-        except Exception as e:
-            self.record_result(
-                "D2_VaccineFlu",
-                "วัคซีน",
-                "Should return valid response",
-                f"Error: {e}",
-                False
-            )
-            print(f"D2. Vaccine flu: FAIL (error: {e})")
+        response = self.chat("ผ่าตัดหัวใจราคาเท่าไหร่")
+        answer = str(response.get("answer") or "")
+        buttons = response.get("action_buttons") or []
+        no_leakage, found = self._assert_no_leakage(answer)
+        passed = (
+            response.get("route") == "fallback"
+            and "0 5446 6666 ต่อ 7000" in answer
+            and buttons == ["กลับหน้าหลัก", "ติดต่อโรงพยาบาล"]
+            and no_leakage
+        )
+        self.record(
+            "Fallback_Unsupported",
+            "ผ่าตัดหัวใจราคาเท่าไหร่",
+            passed,
+            f"route={response.get('route')}, answer={answer!r}, buttons={buttons}, forbidden={found}",
+        )
 
-        # Test D3: Hepatitis B vaccine
-        self.reset_session()
-        try:
-            response = self.chat("วัคซีน")
-            buttons = response.get("action_buttons", []) or []
-            
-            has_hepb = any("ตับ" in b or "hepatitis" in b.lower() for b in buttons)
-            self.record_result(
-                "D3_VaccineHepB",
-                "วัคซีน",
-                "ตับ/hepatitis should be in child options",
-                f"Buttons: {buttons}",
-                has_hepb
-            )
-            print(f"D3. Vaccine Hep B: {'PASS' if has_hepb else 'FAIL'}")
-        except Exception as e:
-            self.record_result(
-                "D3_VaccineHepB",
-                "วัคซีน",
-                "Should return valid response",
-                f"Error: {e}",
-                False
-            )
-            print(f"D3. Vaccine Hep B: FAIL (error: {e})")
-
-        # Test D4: Rabies/Tetanus vaccine
-        self.reset_session()
-        try:
-            response = self.chat("วัคซีน")
-            buttons = response.get("action_buttons", []) or []
-            
-            has_rabies = any("บาดทะยัก" in b or "พิษสุนัข" in b or "rabies" in b.lower() for b in buttons)
-            self.record_result(
-                "D4_VaccineRabies",
-                "วัคซีน",
-                "บาดทะยัก/พิษสุนัข/rabies should be in child options",
-                f"Buttons: {buttons}",
-                has_rabies
-            )
-            print(f"D4. Vaccine rabies: {'PASS' if has_rabies else 'FAIL'}")
-        except Exception as e:
-            self.record_result(
-                "D4_VaccineRabies",
-                "วัคซีน",
-                "Should return valid response",
-                f"Error: {e}",
-                False
-            )
-            print(f"D4. Vaccine rabies: FAIL (error: {e})")
-
-    def run_test_group_e_other_categories(self) -> None:
-        """Test Group E: Coverage for other real categories."""
-        print("\n=== Group E: Other real categories ===")
-
-        test_cases = [
-            ("E1_RightsTransfer", "ย้ายสิทธิ"),
-            ("E2_MedicalHistory", "ขอประวัติการรักษา"),
-            ("E3_TreatmentCost", "ค่ารักษา"),
-            ("E4_Dialysis", "ฟอกไต"),
-            ("E5_BloodDonation", "บริจาคเลือด"),
-            ("E6_Dentist", "หมอฟัน"),
-            ("E7_Jobs", "สมัครงาน"),
-            ("E8_HealthCheck", "ตรวจสุขภาพ"),
-            ("E9_GroupHealthCheck", "ตรวจสุขภาพหมู่คณะ"),
-            ("E10_MedicalCertificate", "ใบรับรองแพทย์"),
-        ]
-
-        for test_name, query in test_cases:
-            self.reset_session()
-            try:
-                response = self.chat(query)
-                selected_category = response.get("selected_category", "") or ""
-                route = response.get("route", "") or ""
-                # FIX: Make passed a real boolean, not a string
-                passed = bool(route in ["answer", "clarify"] and selected_category)
-                self.record_result(
-                    test_name,
-                    query,
-                    f"Route should be answer/clarify with category",
-                    f"Route: {route}, Category: {selected_category}",
-                    passed
-                )
-                print(f"{test_name}: {'PASS' if passed else 'FAIL'}")
-            except Exception as e:
-                self.record_result(
-                    test_name,
-                    query,
-                    "Should return valid response",
-                    f"Error: {e}",
-                    False
-                )
-                print(f"{test_name}: FAIL (error: {e})")
-
-    def run_all_tests(self) -> Dict[str, Any]:
-        """Run all test groups and return summary."""
+    def run_all_tests(self) -> dict[str, Any]:
         print("=" * 60)
         print("Starting Focused Runtime Regression Tests")
         print("=" * 60)
 
-        try:
-            self.run_test_group_a_main_menu()
-            self.run_test_group_b_followup_binding()
-            self.run_test_group_c_schedule_image_context()
-            self.run_test_group_d_vaccine_child_mapping()
-            self.run_test_group_e_other_categories()
-        except Exception as e:
-            print(f"\nERROR: Test execution failed: {e}")
-            return {"error": str(e)}
+        self.run_health_program_test()
+        self.run_health_hours_test()
+        self.run_health_certificate_test()
+        self.run_schedule_eye_test()
+        self.run_schedule_internal_medicine_group_test()
+        self.run_schedule_skin_test()
+        self.run_pediatrics_schedule_test()
+        self.run_pediatric_cardiology_schedule_test()
+        self.run_adult_cardiology_schedule_test()
+        self.run_doctor_name_tests()
+        self.run_reschedule_route_test()
+        self.run_mental_health_specialty_test()
+        self.run_checkup_schedule_test()
+        self.run_elderly_specialty_test()
+        self.run_cancer_specialty_test()
+        self.run_neuro_specialty_test()
+        self.run_ortho_rehab_specialty_test()
+        self.run_opd_hours_route_test()
+        self.run_fallback_test()
 
-        # Calculate summary
         total = len(self.results)
-        passed = sum(1 for r in self.results if r["passed"])
+        passed = sum(1 for item in self.results if item["passed"])
         failed = total - passed
-
         summary = {
             "total_tests": total,
             "passed": passed,
             "failed": failed,
-            "pass_rate": f"{(passed / total * 100):.1f}%" if total > 0 else "0%",
-            "results": self.results
+            "pass_rate": f"{(passed / total * 100):.1f}%" if total else "0%",
+            "results": self.results,
         }
 
         print("\n" + "=" * 60)
@@ -496,33 +525,22 @@ class FocusedRuntimeRegressionTest:
         print(f"Pass rate: {summary['pass_rate']}")
         print("=" * 60)
 
-        # Print failed tests
-        failed_tests = [r for r in self.results if not r["passed"]]
-        if failed_tests:
+        if failed:
             print("\nFailed tests:")
-            for test in failed_tests:
-                print(f"  - {test['test_name']}: {test['details']}")
+            for item in self.results:
+                if not item["passed"]:
+                    print(f"  - {item['test_name']}: {item['details']}")
 
         return summary
 
 
-def main():
-    """Main entry point."""
-    import sys
-    
+def main() -> None:
     base_url = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
-    
     tester = FocusedRuntimeRegressionTest(base_url)
     summary = tester.run_all_tests()
-    
-    # Save results to file
-    output_file = "focused_runtime_regression_results.json"
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
-    
-    print(f"\nResults saved to {output_file}")
-    
-    # Exit with error code if any tests failed
+    with open("focused_runtime_regression_results.json", "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, ensure_ascii=False, indent=2)
+    print("\nResults saved to focused_runtime_regression_results.json")
     sys.exit(0 if summary.get("failed", 0) == 0 else 1)
 
 

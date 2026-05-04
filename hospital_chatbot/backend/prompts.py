@@ -4,9 +4,30 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from datetime import datetime
+import re
 from typing import Iterable
 
 from .retrieval import RetrievalCandidate
+
+UPH_MAIN_PHONE = "0 5446 6666 ต่อ 7000"
+
+_BANNED_LINE_PREFIXES = (
+    "หมายเหตุ:",
+    "ติดต่อ:",
+    "เวลาให้บริการ:",
+    "ค่าใช้จ่าย:",
+    "การเข้ารับบริการ:",
+    "อัปเดตล่าสุด:",
+    "ไฟล์แนบ/รูปประกอบ:",
+)
+_BANNED_LINE_MARKERS = (
+    "หากต้องการถามต่อเกี่ยวกับ",
+    "สามารถถามต่อได้ เช่น",
+)
+_WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:\\")
+_PHONE_ONLY_RE = re.compile(r"^(?:โทร\s*)?(?:0\d[\d\s-]{6,}\d)(?:\s*ต่อ\s*\d+)?$")
+_PHONE_IN_TEXT_RE = re.compile(r"(?:0\d[\d\s-]{6,}\d)(?:\s*ต่อ\s*\d+)?")
+_MULTISPACE_RE = re.compile(r"[ \t]+")
 
 GUIDE_ITEMS = [
     "นัดหมายและตารางแพทย์",
@@ -36,7 +57,7 @@ SYSTEM_PROMPT = (
 def fallback_text() -> str:
     return (
         "ขออภัยค่ะ ขณะนี้ระบบยังไม่พบข้อมูลที่ตรงกับคำถามนี้ในฐานความรู้ที่ยืนยันแล้ว "
-        "แนะนำให้ติดต่อประชาสัมพันธ์โรงพยาบาล โทร 054-466666 ต่อ 7221 หรือ 7222 ค่ะ"
+        f"แนะนำให้ติดต่อโรงพยาบาล โทร {UPH_MAIN_PHONE} ค่ะ"
     )
 
 
@@ -106,6 +127,50 @@ def _listify(value: object) -> list[str]:
     return [item.strip() for item in text.split("|") if item.strip()]
 
 
+def _compact_phone(text: str) -> str:
+    return re.sub(r"\D+", "", str(text or ""))
+
+
+def _normalize_answer_line(text: str) -> str:
+    return _MULTISPACE_RE.sub(" ", str(text or "").replace("\u00a0", " ")).strip()
+
+
+def dedupe_answer_lines(text: str) -> str:
+    seen_lines: set[str] = set()
+    longer_phone_lines: set[str] = set()
+    result: list[str] = []
+    for raw_line in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = _normalize_answer_line(raw_line)
+        if not line:
+            continue
+        if any(line.startswith(prefix) for prefix in _BANNED_LINE_PREFIXES):
+            continue
+        if any(marker in line for marker in _BANNED_LINE_MARKERS):
+            continue
+        if _WINDOWS_PATH_RE.search(line):
+            continue
+
+        normalized = line.casefold()
+        if normalized in seen_lines:
+            continue
+
+        phones = [_compact_phone(match) for match in _PHONE_IN_TEXT_RE.findall(line) if _compact_phone(match)]
+        if _PHONE_ONLY_RE.fullmatch(line) and any(phone in longer_phone_lines for phone in phones):
+            continue
+        if phones and not _PHONE_ONLY_RE.fullmatch(line):
+            longer_phone_lines.update(phones)
+
+        seen_lines.add(normalized)
+        result.append(line)
+    return "\n".join(result).strip()
+
+
+def clean_user_visible_answer(text: str) -> str:
+    cleaned = dedupe_answer_lines(text)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 def display_category_name(category: str | None) -> str:
     return CATEGORY_LABELS.get(str(category or "").strip(), str(category or "").strip())
 
@@ -156,46 +221,7 @@ def build_clarification_text(query: str, candidates: Iterable[RetrievalCandidate
 
 
 def format_direct_answer(top: RetrievalCandidate) -> str:
-    meta = dict(top.metadata or {})
-    parts = [str(top.answer or "").strip()]
-
-    note = str(meta.get("note") or meta.get("notes") or top.notes or "").strip()
-    if note:
-        parts.append(f"หมายเหตุ: {note}")
-
-    if top.department:
-        parts.append(f"หน่วยงาน: {top.department}")
-
-    contact = str(meta.get("followup_contact") or top.contact or "").strip()
-    if contact:
-        parts.append(f"ติดต่อ: {contact}")
-
-    hours = str(meta.get("followup_hours") or "").strip()
-    if hours:
-        parts.append(f"เวลาให้บริการ: {hours}")
-
-    price = str(meta.get("followup_price") or "").strip()
-    if price:
-        parts.append(f"ค่าใช้จ่าย: {price}")
-
-    walkin = str(meta.get("followup_walkin") or "").strip()
-    if walkin:
-        parts.append(f"การเข้ารับบริการ: {walkin}")
-
-    links = _listify(meta.get("followup_link"))
-    if links:
-        parts.append("ลิงก์ที่เกี่ยวข้อง: " + ", ".join(links[:3]))
-
-    images: list[str] = []
-    if images:
-        parts.append("ไฟล์แนบ/รูปประกอบ: " + ", ".join(images[:3]))
-
-    formatted_updated = _format_last_updated(top.last_updated_at)
-    if formatted_updated:
-        parts.append(f"อัปเดตล่าสุด: {formatted_updated}")
-    if top.stale:
-        parts.append("หมายเหตุเพิ่มเติม: ข้อมูลนี้อาจมีการเปลี่ยนแปลง ควรยืนยันกับเจ้าหน้าที่อีกครั้งค่ะ")
-    return "\n".join(part for part in parts if part)
+    return clean_user_visible_answer(top.answer or "")
 
 
 def build_category_not_found_text(query: str, category: str, items: list[str]) -> str:
@@ -212,12 +238,7 @@ def build_category_not_found_text(query: str, category: str, items: list[str]) -
 
 
 def build_followup_hint_text(category: str | None, topic: str | None) -> str:
-    title = display_category_name(category)
-    if topic and title:
-        return f"หากต้องการถามต่อเกี่ยวกับ {topic} สามารถถามต่อได้ เช่น ราคาเท่าไหร่ ติดต่อที่ไหน เปิดวันไหน เข้าได้เลยไหม มีรูปไหม หรือมีลิงก์ไหมค่ะ"
-    if title:
-        return f"สามารถถามต่อในหมวด {title} ได้ หรือกดเลือกหัวข้อจากปุ่มด้านล่างได้เลยค่ะ"
-    return "สามารถพิมพ์รายละเอียดเพิ่ม หรือเลือกหัวข้อจากปุ่มด้านล่างได้เลยค่ะ"
+    return ""
 
 
 def build_llm_messages(question: str, top: RetrievalCandidate, candidates: list[RetrievalCandidate]) -> list[dict[str, str]]:
@@ -236,8 +257,6 @@ def build_grounded_llm_messages(question: str, top: RetrievalCandidate, candidat
         context_lines.append(f"[{idx}] category: {cand.category}")
         context_lines.append(f"[{idx}] title: {cand.question or cand.subcategory or '-'}")
         context_lines.append(f"[{idx}] answer: {cand.answer}")
-        if cand.notes:
-            context_lines.append(f"[{idx}] notes: {cand.notes}")
         if cand.department:
             context_lines.append(f"[{idx}] department: {cand.department}")
         if cand.contact:

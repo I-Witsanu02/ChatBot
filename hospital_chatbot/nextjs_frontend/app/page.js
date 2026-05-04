@@ -40,7 +40,6 @@ const MAIN_THEMES = [
 const GREETING_MESSAGES = [
   "สวัสดีค่ะ ดิฉันน้องฟ้ามุ่ย AI ผู้ช่วยของโรงพยาบาลมหาวิทยาลัยพะเยา 🏥 มีอะไรให้ช่วยไหมคะ?",
   "ดิฉันพร้อมตอบคำถามเกี่ยวกับบริการของโรงพยาบาล เช่น นัดหมาย ตารางแพทย์ วัคซีน ตรวจสุขภาพ เวชระเบียน สิทธิการรักษา และการติดต่อหน่วยงานค่ะ",
-  "หมายเหตุ: หากต้องการติดต่อโรงพยาบาลทันตกรรม คณะทันตแพทยศาสตร์ โทร 054 466 666 ต่อ 4701 หรือ 064-9926448",
 ];
 
 const FALLBACK_KEYWORDS = ["ไม่พบข้อมูล", "ขออภัย", "ไม่สามารถ", "ไม่เข้าใจ"];
@@ -94,6 +93,20 @@ function resolveAttachmentUrl(rawUrl) {
   if (!value) return "";
   if (/^https?:\/\//i.test(value)) return value;
   return `${API_BASE}${value}`;
+}
+
+function dedupeAttachments(items) {
+  const seen = new Set();
+  const result = [];
+  for (const item of Array.isArray(items) ? items : []) {
+    if (!item || typeof item !== "object") continue;
+    const url = resolveAttachmentUrl(item.url);
+    if (!url) continue;
+    if (seen.has(url)) continue;
+    seen.add(url);
+    result.push({ ...item, url });
+  }
+  return result;
 }
 
 /* ─────────────────────── Utilities ──────────────────────── */
@@ -281,7 +294,7 @@ export default function HomePage() {
       setIsSearching(false);
       setMessages(prev => [
         ...prev,
-        { role: "bot", texts: ["ขออภัยค่ะ การเชื่อมต่อใช้เวลานานเกินไป กรุณาลองใหม่อีกครั้งหรือโทร 054-466666 ค่ะ"], attachments: [] },
+        { role: "bot", texts: ["ขออภัยค่ะ การเชื่อมต่อใช้เวลานานเกินไป กรุณาลองใหม่อีกครั้ง หรือโทร 0 5446 6666 ต่อ 7000 ค่ะ"], attachments: [] },
       ]);
     }, LOADING_TIMEOUT_MS);
   }
@@ -399,7 +412,7 @@ export default function HomePage() {
         debugChat("sendMessage timeout");
         setMessages(prev => [
           ...prev,
-          { role: "bot", texts: ["ขออภัยค่ะ การเชื่อมต่อใช้เวลานานเกินไป กรุณาลองใหม่อีกครั้งหรือโทร 054-466666 ค่ะ"], attachments: [] },
+          { role: "bot", texts: ["ขออภัยค่ะ การเชื่อมต่อใช้เวลานานเกินไป กรุณาลองใหม่อีกครั้ง หรือโทร 0 5446 6666 ต่อ 7000 ค่ะ"], attachments: [] },
         ]);
       } else {
         debugChat("sendMessage error:", error.message);
@@ -505,7 +518,7 @@ export default function HomePage() {
           <div style={{ display: "flex", gap: "1.5rem", alignItems: "center" }}>
             <a href="tel:054466666" className="emergency-btn">
               <span className="material-icons-outlined" style={{ fontSize: "1rem" }}>phone</span>
-              เบอร์ฉุกเฉิน 054-466-666
+              ติดต่อโรงพยาบาล 0 5446 6666 ต่อ 7000
             </a>
             <div style={{ display: "flex", gap: "1.5rem", fontSize: ".82rem" }}>
               <a href="https://uph.up.ac.th" target="_blank" rel="noreferrer">บทความสาระน่ารู้</a>
@@ -597,7 +610,7 @@ export default function HomePage() {
               </li>
               <li>
                 <span className="material-icons-outlined mi">phone</span>
-                054 466 666
+                0 5446 6666 ต่อ 7000
               </li>
               <li>
                 <span className="material-icons-outlined mi">email</span>
@@ -692,7 +705,7 @@ export default function HomePage() {
               // Defensive rendering: ensure message structure is valid
               const role = String(m?.role || "bot");
               const texts = Array.isArray(m?.texts) ? m.texts : ["ไม่สามารถแสดงข้อความได้"];
-              const attachments = Array.isArray(m?.attachments) ? m.attachments : [];
+              const attachments = dedupeAttachments(m?.attachments);
 
               return (
                 <div key={i} className={`msg msg-${role === "user" ? "user" : "bot"}`}>
@@ -713,7 +726,7 @@ export default function HomePage() {
                       {attachments.map((att, k) => {
                         if (!att || typeof att !== "object") return null;
                         const attType = String(att.type || "").toLowerCase();
-                        const attUrl = resolveAttachmentUrl(att.url);
+                        const attUrl = String(att.url || "");
                         const attLabel = String(att.label || att.filename || "ไฟล์แนบ");
 
                         return attType === "image" ? (

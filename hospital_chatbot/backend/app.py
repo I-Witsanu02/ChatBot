@@ -51,14 +51,16 @@ from .model_config import DEFAULT_LOCK_PATH, ensure_lock_file, runtime_summary
 from .policies import decide
 from .prompts import (
     GUIDE_ITEMS,
+    UPH_MAIN_PHONE,
     WELCOME_MESSAGE,
     build_category_not_found_text,
     build_category_overview,
     build_clarification_options,
     build_clarification_text,
-    build_followup_hint_text,
     build_grounded_llm_messages,
     build_llm_messages,
+    clean_user_visible_answer,
+    dedupe_answer_lines,
     display_category_name,
     emergency_text,
     fallback_text,
@@ -124,6 +126,16 @@ ANSWER_MODE = os.getenv("ANSWER_MODE", "kb_exact").strip().lower()
 RAG_GROUNDED_LLM = os.getenv("RAG_GROUNDED_LLM", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
 MENU_MODE = os.getenv("MENU_MODE", "tree_first").strip().lower()
 FOLLOWUP_MODE = os.getenv("FOLLOWUP_MODE", "slot_first").strip().lower()
+
+FALLBACK_ACTION_BUTTONS = ["กลับหน้าหลัก", "ติดต่อโรงพยาบาล"]
+
+
+def _official_fallback_answer() -> str:
+    return f"ไม่พบข้อมูลนี้ในระบบปัจจุบัน กรุณาติดต่อโรงพยาบาลมหาวิทยาลัยพะเยา โทร {UPH_MAIN_PHONE} เพื่อสอบถามเพิ่มเติม"
+
+
+def _official_contact_answer() -> str:
+    return f"ติดต่อโรงพยาบาลมหาวิทยาลัยพะเยา โทร {UPH_MAIN_PHONE}"
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -402,14 +414,30 @@ SCHEDULE_SPECIALTY_MENU: list[str] = [
 ]
 
 SCHEDULE_DEPARTMENT_MENU: list[str] = [
+    "ค้นหาตามเฉพาะทาง",
     "ผู้ป่วยนอก 1/OPD 1",
     "ผู้ป่วยนอก 2/OPD 2",
     "ผู้ป่วยนอก 3/OPD 3",
     "ผู้ป่วยนอก 4/OPD 4",
     "ศูนย์ศัลยกรรมกระดูกและข้อ",
-    "ค้นหาตามเฉพาะทาง",
     "กลับไปหมวดนัดหมายและตารางแพทย์",
 ]
+
+HEALTH_CHECK_SHORTCUTS: dict[str, tuple[str, str]] = {
+    "เวลาตรวจสุขภาพ": ("qa-0050", "ตรวจสุขภาพรายบุคคล"),
+    "โปรแกรมตรวจสุขภาพ": ("qa-0049", "ตรวจสุขภาพรายบุคคล"),
+    "ใบรับรองแพทย์": ("qa-0053", "การขอเอกสารทางการแพทย์"),
+}
+
+HEALTH_CHECK_PROGRAM_ANSWER = (
+    "ติดต่อแผนกตรวจสุขภาพ โทร 054 466 666 ต่อ 7173 เวลา 08.00-16.00 น. "
+    "ทุกวันทำการ หยุดทุกวันเสาร์-อาทิตย์ และวันหยุดนักขัตฤกษ์ หรือแอดไลน์ @897idbib"
+)
+HEALTH_CHECK_HOURS_ANSWER = (
+    "เวลา 08.00-16.00 น. ทุกวันทำการ หยุดทุกวันเสาร์-อาทิตย์ "
+    "และวันหยุดนักขัตฤกษ์ หรือแอดไลน์ @897idbib"
+)
+HEALTH_CHECK_CERTIFICATE_ANSWER = HEALTH_CHECK_PROGRAM_ANSWER
 
 SCHEDULE_DEPARTMENT_SPECIALTIES: dict[str, list[str]] = {
     "ผู้ป่วยนอก 1/OPD 1": [
@@ -711,6 +739,11 @@ def _normalize_typo(query: str) -> tuple[str, str | None]:
     if best and best_score >= 0.78:
         return best[1], best[0]
     return query, None
+
+
+def _looks_like_query_plus_noise_legacy(query: str) -> str:
+    # Legacy placeholder retained only to minimize patch churn after earlier merges.
+    return query
 
 
 def _looks_like_query_plus_noise(query: str) -> str:
@@ -1098,7 +1131,7 @@ def _slot_value(topic: RetrievalCandidate, slot: str) -> str:
     value = str(meta.get(f"followup_{slot}") or "").strip()
     if value:
         return value
-    fallback_text = "\n".join([str(meta.get("answer") or topic.answer or ""), str(meta.get("note") or meta.get("notes") or topic.notes or "")])
+    fallback_text = str(meta.get("answer") or topic.answer or "")
     return _extract_slot_from_text(fallback_text, slot)
 
 
@@ -1108,18 +1141,10 @@ def _build_followup_slot_answer(topic: RetrievalCandidate, query: str) -> str | 
         return None
     value = _slot_value(topic, slot)
     if value:
-        labels = {
-            "price": "ราคา",
-            "contact": "ติดต่อ",
-            "hours": "วันและเวลา",
-            "walkin": "เงื่อนไขการเข้ารับบริการ",
-            "link": "ลิงก์",
-            "image": "ไฟล์แนบ",
-        }
-        return f"{labels.get(slot, slot)}: {value}"
+        return clean_user_visible_answer(value)
     contact = _slot_value(topic, "contact")
     if contact:
-        return f"ยังไม่มีรายละเอียดเฉพาะเรื่องนี้ในระบบค่ะ แนะนำติดต่อหน่วยงานที่เกี่ยวข้อง: {contact}"
+        return clean_user_visible_answer(contact)
     return "ยังไม่มีรายละเอียดเฉพาะเรื่องนี้ในระบบค่ะ"
 
 
@@ -1162,6 +1187,127 @@ def _is_schedule_query(query: str) -> bool:
 
 def _schedule_rows() -> list[dict[str, Any]]:
     return _active_rows(category="นัดหมายและตารางแพทย์", subcategory="ตารางแพทย์ออกตรวจ", record_type="schedule_specific")
+
+
+SCHEDULE_TOPIC_ROW_OVERRIDES: dict[str, list[str]] = {
+    "จักษุแพทย์ (ตา)": [
+        "- วันจันทร์วันพุธ 08.00-16.00 น. : นายแพทย์ดนัยภัทร วงษ์วรศรีโรจน์",
+        "- วันพุธ 08.00-12.00 น. : ยังไม่ระบุชื่อแพทย์ในข้อมูล",
+        "- วันอังคาร 08.00-12.00 น. : แพทย์หญิงชญานี วิวัฒนเศรษฐ์",
+        "- วันพฤหัสบดี 08.00-16.00 น. : ยังไม่ระบุชื่อแพทย์ในข้อมูล",
+    ],
+}
+
+
+def _schedule_row_entries_from_text(answer: str) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    for raw_line in str(answer or "").splitlines():
+        line = str(raw_line or "").strip()
+        if not line.startswith("-"):
+            continue
+        body = line[1:].strip()
+        if ":" in body:
+            left, right = body.split(":", 1)
+            entries.append((left.strip(), right.strip() or "ยังไม่ระบุชื่อแพทย์ในข้อมูล"))
+        elif body:
+            entries.append((body, "ยังไม่ระบุชื่อแพทย์ในข้อมูล"))
+    return entries
+
+
+def _doctor_aliases(doctor_name: str) -> set[str]:
+    doctor = str(doctor_name or "").strip()
+    if not doctor or doctor == "ยังไม่ระบุชื่อแพทย์ในข้อมูล":
+        return set()
+    aliases = {doctor}
+    for title in ("นายแพทย์", "แพทย์หญิง", "นพ.", "พญ."):
+        if doctor.startswith(title):
+            stripped = doctor[len(title):].strip()
+            if stripped:
+                first_name = stripped.split()[0]
+                aliases.update({stripped, first_name, f"หมอ{first_name}", f"{title}{first_name}"})
+    parts = doctor.split()
+    if parts:
+        aliases.add(parts[-1])
+        if len(parts) >= 2:
+            aliases.add(parts[-2] if parts[0] in {"นายแพทย์", "แพทย์หญิง", "นพ.", "พญ."} and len(parts) >= 3 else parts[0])
+    return {alias for alias in aliases if alias}
+
+
+def _match_schedule_doctor(query: str) -> dict[str, Any] | None:
+    qc = _compact_normalize(query)
+    if not qc:
+        return None
+
+    # BUG 3 FIX: Add stricter matching rules to prevent generic words from matching doctor names
+    generic_words = {
+        "สุขภาพ", "จิต", "ชุมชน", "ตรวจสุขภาพ", "อายุรกรรม",
+        "ผู้สูงอายุ", "คลินิก", "แพทย์", "หมอ", "นพ", "พญ",
+        "โรงพยาบาล", "แผนก", "บริการ", "ตรวจ", "รักษา",
+    }
+    if qc in generic_words or len(qc) <= 2:
+        return None
+
+    # Check if query has explicit doctor intent markers
+    doctor_intent_markers = {"หมอ", "แพทย์", "นพ", "พญ", "นายแพทย์", "แพทย์หญิง"}
+    has_explicit_doctor_intent = any(marker in query for marker in doctor_intent_markers)
+
+    matches: list[dict[str, Any]] = []
+    min_alias_len = 2 if len(qc) <= 3 else 3
+    for row in _schedule_rows():
+        topic = _record_to_candidate(row, 0.95, source="schedule")
+        specialty = str((topic.metadata or {}).get("topic") or topic.question or "").strip()
+        for day_text, doctor_name in _schedule_row_entries_from_text(topic.answer):
+            for alias in _doctor_aliases(doctor_name):
+                alias_compact = _compact_normalize(alias)
+                if not alias_compact or len(alias_compact) < min_alias_len:
+                    continue
+                score = 0.0
+                if qc == alias_compact:
+                    score = 1.0
+                elif alias_compact in qc and len(alias_compact) >= 3:
+                    # BUG 3 FIX: Stricter scoring - require higher confidence
+                    if len(qc) >= 6 or has_explicit_doctor_intent:
+                        score = 0.96
+                elif qc in alias_compact and len(qc) >= 4:
+                    # BUG 3 FIX: Stricter scoring - require higher confidence
+                    if len(qc) >= 5 or has_explicit_doctor_intent:
+                        score = 0.94
+                if score:
+                    matches.append({
+                        "topic": topic,
+                        "doctor": doctor_name,
+                        "specialty": specialty,
+                        "day_text": day_text,
+                        "score": score,
+                    })
+                    break
+    if not matches:
+        return None
+    matches.sort(key=lambda item: (-item["score"], item["doctor"], item["day_text"]))
+    # BUG 3 FIX: Require higher confidence threshold
+    if matches[0]["score"] < 0.94:
+        return None
+    unique_doctors = list(dict.fromkeys(item["doctor"] for item in matches))
+    if len(unique_doctors) > 1 and len(qc) <= 2:
+        return {"ambiguous_doctors": unique_doctors[:5]}
+    top_doctor = matches[0]["doctor"]
+    top_matches = [item for item in matches if item["doctor"] == top_doctor]
+    return {"topic": top_matches[0]["topic"], "doctor": top_doctor, "rows": top_matches}
+
+
+def _format_schedule_doctor_answer(match: dict[str, Any]) -> str:
+    topic = match["topic"]
+    doctor_name = str(match["doctor"] or "").strip()
+    specialty = str((topic.metadata or {}).get("topic") or topic.question or "").strip()
+    department = str((topic.metadata or {}).get("clinic") or topic.department or "").strip()
+    lines = [f"{doctor_name} ออกตรวจเฉพาะทาง{specialty} ที่{department}"]
+    seen_rows: set[str] = set()
+    for row in match.get("rows", []):
+        day_text = str(row.get("day_text") or "").strip()
+        if day_text and day_text not in seen_rows:
+            seen_rows.add(day_text)
+            lines.append(f"- {day_text}")
+    return clean_user_visible_answer("\n".join(lines))
 
 
 def _match_schedule_record(query: str) -> RetrievalCandidate | None:
@@ -1247,6 +1393,751 @@ def _match_schedule_record(query: str) -> RetrievalCandidate | None:
     if best[0] is not None and best[1] >= 0.62:
         return _record_to_candidate(best[0], best[1], source="schedule")
     return None
+
+
+@dataclass
+class ScheduleMasterRow:
+    day_text: str
+    time_text: str
+    doctor_name: str
+    subspecialty: str = ""
+    department: str = ""
+
+
+@dataclass
+class ScheduleMasterEntry:
+    specialty: str
+    department: str = ""
+    aliases: list[str] = field(default_factory=list)
+    rows: list[ScheduleMasterRow] = field(default_factory=list)
+    image_filenames: list[str] = field(default_factory=list)
+    source_id: str | None = None
+    has_hidden_rows: bool = False
+
+
+SCHEDULE_UNNAMED_PUBLIC_NOTICE = "บางช่วงเวลาในรูปตารางอาจยังไม่ระบุชื่อแพทย์ กรุณาดูรูปประกอบค่ะ"
+SCHEDULE_GENERIC_ALIASES = {
+    "ตารางแพทย์",
+    "ตารางแพทย์ออกตรวจ",
+    "นัดหมายและตารางแพทย์",
+    "นัดหมาย",
+    "วันนัด",
+    "opd",
+    "หมอ",
+    "แพทย์",
+    "med",
+}
+SCHEDULE_SOURCE_TO_CANONICAL: dict[str, str] = {
+    "จักษุแพทย์ (ตา)": "จักษุแพทย์ (ตา)",
+    "ระบบทางเดินปัสสาวะ": "ระบบทางเดินปัสสาวะ",
+    "อายุรแพทย์โรคผิวหนัง (ผิวหนัง)": "ผิวหนัง",
+    "โสต ศอ นาสิกแพทย์ (หูคอจมูก)": "หู คอ จมูก",
+    "แพทย์สูติศาสตร์และนรีเวช ฯ (สูตินรีเวช)": "สูตินรีเวช",
+    "กุมารแพทย์": "กุมารแพทย์",
+    "กุมารแพทย์ โรคหัวใจ": "กุมารแพทย์ โรคหัวใจ",
+    "อายุรกรรม (Med)": "อายุรกรรม",
+    "อายุรแพทย์ ระบบประสาทและสมอง": "ระบบประสาทและสมอง",
+    "อายุรแพทย์ผู้สูงอายุ": "อายุรแพทย์คลินิกผู้สูงอายุ",
+    "อายุรแพทย์มะเร็งวิทยา": "อายุรแพทย์มะเร็งวิทยา",
+    "อายุรแพทย์โรคหัวใจ": "อายุรแพทย์โรคหัวใจ",
+    "ทั่วไป (GP)": "ทั่วไป",
+    "สุขภาพจิตชุมชน": "สุขภาพจิตชุมชน",
+    "เวชศาสตร์ป้องกัน (ตรวจสุขภาพ)": "ตรวจสุขภาพ",
+    "ออร์โธปิดิคส์บูรณสภาพ": "ออร์โธปิดิคส์บูรณสภาพ",
+}
+SCHEDULE_CANONICAL_ALIASES: dict[str, list[str]] = {
+    "ระบบทางเดินปัสสาวะ": ["ทางเดินปัสสาวะ", "หมอทางเดินปัสสาวะ", "urology"],
+    "ผิวหนัง": ["อายุรแพทย์โรคผิวหนัง", "หมอผิวหนัง", "หมอหนัง", "คลินิกผิวหนัง"],
+    "จักษุแพทย์ (ตา)": ["จักษุแพทย์", "หมอตา", "ตา", "จักษุ"],
+    "หู คอ จมูก": ["หูคอจมูก", "หมอหูคอจมูก", "ent", "โสต ศอ นาสิกแพทย์"],
+    "กุมารแพทย์": ["กุมาร", "หมอเด็ก", "เด็ก"],
+    "กุมารแพทย์ โรคหัวใจ": ["กุมารแพทย์โรคหัวใจ", "กุมารแพทย์ โรคหัวใจ", "เด็กโรคหัวใจ"],
+    "สูตินรีเวช": ["สูติ", "นรีเวช", "สูติและนรีเวช"],
+    "ศัลยแพทย์กระดูกและข้อ": ["หมอกระดูก", "กระดูก", "กระดูกและข้อ", "ออร์โธ", "orthopedic"],
+    "เวชศาสตร์การกีฬา": ["เวชศาสตร์", "เวชศาสตร์กีฬา"],
+    "อายุรกรรม": ["อายุรแพทย์", "อายุรแพทย์ทั่วไป", "อายุรกรรม med", "internal medicine"],
+    "อายุรแพทย์โรคหัวใจ": ["อายุรแพทย์โรคหัวใจ", "อายุรแพทย์ หัวใจ", "หมอหัวใจ"],
+    "รังสีวินิจฉัย": ["รังสี", "รังสีวินิจฉัย"],
+    "สุขภาพจิตชุมชน": ["สุขภาพจิตชุมชน", "จิตชุมชน"],
+    "ตรวจสุขภาพ": ["ตรวจสุขภาพ", "เวชศาสตร์ป้องกัน", "เวชศาสตร์ป้องกัน (ตรวจสุขภาพ)"],
+    "อายุรแพทย์คลินิกผู้สูงอายุ": ["อายุรแพทย์ผู้สูงอายุ", "อายุรแพทย์คลินิกผู้สูงอายุ"],
+    "อายุรแพทย์มะเร็งวิทยา": ["อายุรแพทย์มะเร็งวิทยา", "มะเร็งวิทยา"],
+    "ระบบประสาทและสมอง": ["ระบบประสาทและสมอง", "อายุรแพทย์ระบบประสาทและสมอง", "อายุรแพทย์ ระบบประสาทและสมอง"],
+    "ออร์โธปิดิคส์บูรณสภาพ": ["ออร์โธปิดิคส์บูรณสภาพ", "ออร์โธปิดิคส์", "บูรณสภาพ"],
+}
+
+# BUG 8 FIX: Add canonical constants for validation
+CANONICAL_SCHEDULE_SPECIALTIES = frozenset(SCHEDULE_CANONICAL_ALIASES.keys())
+CANONICAL_CATEGORIES = frozenset([
+    "นัดหมายและตารางแพทย์",
+    "วัคซีนและบริการผู้ป่วยนอก",
+    "เวชระเบียน สิทธิ และค่าใช้จ่าย",
+    "ตรวจสุขภาพและใบรับรองแพทย์",
+    "ติดต่อหน่วยงานเฉพาะและสมัครงาน",
+])
+
+logger = logging.getLogger(__name__)
+SCHEDULE_CANONICAL_IMAGE_MAP: dict[str, tuple[str, ...]] = {
+    "ระบบทางเดินปัสสาวะ": ("ทางเดินปัสสาวะ.png",),
+    "ผิวหนัง": ("ผิวหนัง.png",),
+    "จักษุแพทย์ (ตา)": ("ตา.png",),
+    "หู คอ จมูก": ("หูคอจมูก.png",),
+    "กุมารแพทย์": ("กุมารแพทย์.png",),
+    "กุมารแพทย์ โรคหัวใจ": ("กุมารแพทย์.png",),
+    "สูตินรีเวช": ("สูติ-นรีเวช.jpg",),
+    "ศัลยแพทย์กระดูกและข้อ": ("กระดูกและข้อ.png",),
+    "เวชศาสตร์การกีฬา": ("เวชศาสตร์.png",),
+    "เวชศาสตร์ครอบครัว": ("เวชศาสตร์.png",),
+    "เวชศาสตร์ป้องกัน (ตรวจสุขภาพ)": ("เวชศาสตร์.png",),
+    "ตรวจสุขภาพ": ("เวชศาสตร์.png",),
+    "สุขภาพจิตชุมชน": ("เวชศาสตร์.png",),
+    "อายุรแพทย์คลินิกผู้สูงอายุ": ("อายุรกรรม 1.png",),
+    "อายุรแพทย์มะเร็งวิทยา": ("อายุรกรรม 1.png",),
+    "อายุรแพทย์โรคหัวใจ": ("อายุรกรรม 1.png",),
+    "ระบบประสาทและสมอง": ("อายุรกรรม 1.png", "อายุรกรรม 2.png"),
+    "ออร์โธปิดิคส์บูรณสภาพ": ("กระดูกและข้อ.png",),
+    "อายุรกรรม": ("อายุรกรรม 1.png", "อายุรกรรม 2.png"),
+    "รังสีวินิจฉัย": ("รังสีวินิจฉัย.png",),
+}
+SCHEDULE_MASTER_ROW_OVERRIDES: dict[str, list[ScheduleMasterRow]] = {
+    "จักษุแพทย์ (ตา)": [
+        ScheduleMasterRow(day_text="วันอังคาร", time_text="08.00-12.00 น.", doctor_name="แพทย์หญิงชญานี วิวัฒนเศรษฐ์", subspecialty="จักษุแพทย์", department="ผู้ป่วยนอก 3/OPD 3"),
+        ScheduleMasterRow(day_text="วันพฤหัสบดี", time_text="08.00-16.00 น.", doctor_name="แพทย์หญิงชญานี วิวัฒนเศรษฐ์", subspecialty="จักษุแพทย์", department="ผู้ป่วยนอก 3/OPD 3"),
+        ScheduleMasterRow(day_text="วันจันทร์", time_text="08.00-16.00 น.", doctor_name="นายแพทย์ดนัยภัทร วงษ์วรศรีโรจน์", subspecialty="จักษุแพทย์", department="ผู้ป่วยนอก 3/OPD 3"),
+        ScheduleMasterRow(day_text="วันพุธ", time_text="08.00-12.00 น.", doctor_name="นายแพทย์ดนัยภัทร วงษ์วรศรีโรจน์", subspecialty="จักษุแพทย์", department="ผู้ป่วยนอก 3/OPD 3"),
+    ],
+    "กุมารแพทย์": [
+        ScheduleMasterRow(day_text="วันจันทร์", time_text="08.00-16.00 น.", doctor_name="แพทย์หญิงเพ็ญพรรณ กันฑะษา", subspecialty="กุมารแพทย์", department="ผู้ป่วยนอก 3/OPD 3"),
+        ScheduleMasterRow(day_text="วันอังคาร", time_text="13.00-16.00 น.", doctor_name="แพทย์หญิงเพ็ญพรรณ กันฑะษา", subspecialty="กุมารแพทย์", department="ผู้ป่วยนอก 3/OPD 3"),
+        ScheduleMasterRow(day_text="วันอังคาร", time_text="08.00-12.00 น.", doctor_name="นายแพทย์สรกิจ ภาคีชีพ", subspecialty="กุมารแพทย์", department="ผู้ป่วยนอก 3/OPD 3"),
+        ScheduleMasterRow(day_text="วันพฤหัสบดี", time_text="08.00-12.00 น.", doctor_name="นายแพทย์สรกิจ ภาคีชีพ", subspecialty="กุมารแพทย์", department="ผู้ป่วยนอก 3/OPD 3"),
+        ScheduleMasterRow(day_text="วันศุกร์", time_text="08.00-12.00 น.", doctor_name="แพทย์หญิงเพ็ญพรรณ กันฑะษา", subspecialty="กุมารแพทย์", department="ผู้ป่วยนอก 3/OPD 3"),
+    ],
+    "กุมารแพทย์ โรคหัวใจ": [
+        ScheduleMasterRow(day_text="วันอังคาร", time_text="13.00-16.00 น.", doctor_name="แพทย์หญิงสรัสวดี เถลิงศก", subspecialty="กุมารแพทย์ โรคหัวใจ", department="ผู้ป่วยนอก 3/OPD 3"),
+        ScheduleMasterRow(day_text="วันพุธ", time_text="08.00-16.00 น.", doctor_name="แพทย์หญิงสรัสวดี เถลิงศก", subspecialty="กุมารแพทย์ โรคหัวใจ", department="ผู้ป่วยนอก 3/OPD 3"),
+        ScheduleMasterRow(day_text="วันศุกร์", time_text="08.00-12.00 น.", doctor_name="แพทย์หญิงสรัสวดี เถลิงศก", subspecialty="กุมารแพทย์ โรคหัวใจ", department="ผู้ป่วยนอก 3/OPD 3"),
+    ],
+    "ผิวหนัง": [
+        ScheduleMasterRow(day_text="วันจันทร์", time_text="09.00-16.00 น.", doctor_name="แพทย์หญิงภัทรภร กุมภวิจิตร", subspecialty="แพทย์โรคผิวหนัง ตจวิทยา", department="ผู้ป่วยนอก 2/OPD 2"),
+        ScheduleMasterRow(day_text="วันพุธ", time_text="09.00-16.00 น.", doctor_name="แพทย์หญิงภัทรภร กุมภวิจิตร", subspecialty="แพทย์โรคผิวหนัง ตจวิทยา", department="ผู้ป่วยนอก 2/OPD 2"),
+        ScheduleMasterRow(day_text="วันศุกร์", time_text="09.00-12.00 น.", doctor_name="แพทย์หญิงภัทรภร กุมภวิจิตร", subspecialty="แพทย์โรคผิวหนัง ตจวิทยา", department="ผู้ป่วยนอก 2/OPD 2"),
+        ScheduleMasterRow(day_text="วันอังคาร", time_text="09.00-16.00 น.", doctor_name="นายแพทย์วสุชล ชัยชาญ", subspecialty="อายุรแพทย์โรคผิวหนัง", department="ผู้ป่วยนอก 2/OPD 2"),
+        ScheduleMasterRow(day_text="วันพฤหัสบดี", time_text="09.00-16.00 น.", doctor_name="นายแพทย์วสุชล ชัยชาญ", subspecialty="อายุรแพทย์โรคผิวหนัง", department="ผู้ป่วยนอก 2/OPD 2"),
+        ScheduleMasterRow(day_text="วันศุกร์", time_text="09.00-12.00 น.", doctor_name="นายแพทย์วสุชล ชัยชาญ", subspecialty="อายุรแพทย์โรคผิวหนัง", department="ผู้ป่วยนอก 2/OPD 2"),
+    ],
+    "อายุรกรรม": [
+        ScheduleMasterRow(day_text="วันศุกร์", time_text="08.00-16.00 น.", doctor_name="นายแพทย์ภาษา สุขสอน", subspecialty="อายุรแพทย์คลินิกผู้สูงอายุ", department="ผู้ป่วยนอก 2/OPD 2"),
+        ScheduleMasterRow(day_text="วันพฤหัสบดี", time_text="08.00-12.00 น.", doctor_name="แพทย์หญิงมัลลิกา ขวัญเมือง", subspecialty="อายุรแพทย์มะเร็งวิทยา", department="ผู้ป่วยนอก 2/OPD 2"),
+        ScheduleMasterRow(day_text="วันพุธ", time_text="08.00-16.00 น.", doctor_name="แพทย์หญิงกานต์ธิรา กิตติสีแสง", subspecialty="อายุรแพทย์โรคระบบทางเดินอาหาร"),
+        ScheduleMasterRow(day_text="วันศุกร์", time_text="08.00-12.00 น.", doctor_name="แพทย์หญิงกานต์ธิรา กิตติสีแสง", subspecialty="อายุรแพทย์โรคระบบทางเดินอาหาร"),
+        ScheduleMasterRow(day_text="วันพฤหัสบดี", time_text="08.00-16.00 น.", doctor_name="นายแพทย์พงศธร ทั้งสุข", subspecialty="อายุรแพทย์โรคหัวใจ", department="ผู้ป่วยนอก 4/OPD 4"),
+        ScheduleMasterRow(day_text="วันพฤหัสบดี", time_text="08.00-16.00 น.", doctor_name="นายแพทย์วัชเรสร พันธ์พัฒนกุล", subspecialty="อายุรแพทย์ระบบประสาทและสมอง", department="ผู้ป่วยนอก 4/OPD 4"),
+        ScheduleMasterRow(day_text="วันศุกร์", time_text="08.00-16.00 น.", doctor_name="นายแพทย์วัชเรสร พันธ์พัฒนกุล", subspecialty="อายุรแพทย์ระบบประสาทและสมอง", department="ผู้ป่วยนอก 4/OPD 4"),
+        ScheduleMasterRow(day_text="วันจันทร์", time_text="08.00-16.00 น.", doctor_name="นายแพทย์คามิน สุทธิกุลบุตร", subspecialty="อายุรแพทย์ทั่วไป", department="ผู้ป่วยนอก 1/OPD 1"),
+        ScheduleMasterRow(day_text="วันพุธ", time_text="08.00-12.00 น.", doctor_name="นายแพทย์คามิน สุทธิกุลบุตร", subspecialty="อายุรแพทย์ทั่วไป", department="ผู้ป่วยนอก 1/OPD 1"),
+        ScheduleMasterRow(day_text="วันอังคาร", time_text="08.00-16.00 น.", doctor_name="แพทย์หญิงเพชราภรณ์ ชัชวรัตน์", subspecialty="อายุรแพทย์ทั่วไป", department="ผู้ป่วยนอก 1/OPD 1"),
+        ScheduleMasterRow(day_text="วันพุธ", time_text="08.00-16.00 น.", doctor_name="แพทย์หญิงเพชราภรณ์ ชัชวรัตน์", subspecialty="อายุรแพทย์ทั่วไป", department="ผู้ป่วยนอก 1/OPD 1"),
+        ScheduleMasterRow(day_text="วันพฤหัสบดี", time_text="08.00-16.00 น.", doctor_name="นายแพทย์มนัส โชติเจริญรัตน์", subspecialty="อายุรแพทย์ทั่วไป", department="ผู้ป่วยนอก 1/OPD 1"),
+        ScheduleMasterRow(day_text="วันศุกร์", time_text="08.00-16.00 น.", doctor_name="นายแพทย์มนัส โชติเจริญรัตน์", subspecialty="อายุรแพทย์ทั่วไป", department="ผู้ป่วยนอก 1/OPD 1"),
+        ScheduleMasterRow(day_text="วันอังคาร", time_text="08.00-16.00 น.", doctor_name="แพทย์หญิงจิตราภรณ์ วงษ์เพิก", subspecialty="อายุรแพทย์ระบบประสาทและสมอง", department="ผู้ป่วยนอก 4/OPD 4"),
+        ScheduleMasterRow(day_text="วันพุธ", time_text="08.00-16.00 น.", doctor_name="แพทย์หญิงจิตราภรณ์ วงษ์เพิก", subspecialty="อายุรแพทย์ระบบประสาทและสมอง", department="ผู้ป่วยนอก 4/OPD 4"),
+    ],
+    # BUG 2 & 4 FIX: Add entry for สุขภาพจิตชุมชน
+    "สุขภาพจิตชุมชน": [
+        ScheduleMasterRow(day_text="วันจันทร์-วันศุกร์", time_text="08.00-12.00 น.", doctor_name="นายแพทย์เธียรชัย คฤหโยธิน", subspecialty="สุขภาพจิตชุมชน", department="ผู้ป่วยนอก 1/OPD 1"),
+    ],
+    "ตรวจสุขภาพ": [
+        ScheduleMasterRow(day_text="วันจันทร์และวันอังคาร", time_text="08.00-16.00 น.", doctor_name="แพทย์หญิงชนกนันท์ เนติศุภลักษณ์", subspecialty="เวชศาสตร์ป้องกัน (ตรวจสุขภาพ)", department="ผู้ป่วยนอก 2/OPD 2"),
+        ScheduleMasterRow(day_text="วันพฤหัสบดี", time_text="08.00-16.00 น.", doctor_name="แพทย์หญิงอชิรญา ชนะพาล", subspecialty="เวชศาสตร์ป้องกัน (ตรวจสุขภาพ)", department="ผู้ป่วยนอก 2/OPD 2"),
+        ScheduleMasterRow(day_text="วันศุกร์", time_text="08.00-12.00 น.", doctor_name="แพทย์หญิงอชิรญา ชนะพาล", subspecialty="เวชศาสตร์ป้องกัน (ตรวจสุขภาพ)", department="ผู้ป่วยนอก 2/OPD 2"),
+    ],
+    "อายุรแพทย์คลินิกผู้สูงอายุ": [
+        ScheduleMasterRow(day_text="วันศุกร์", time_text="08.00-16.00 น.", doctor_name="นายแพทย์ภาษา สุขสอน", subspecialty="อายุรแพทย์คลินิกผู้สูงอายุ", department="ผู้ป่วยนอก 2/OPD 2"),
+    ],
+    "อายุรแพทย์มะเร็งวิทยา": [
+        ScheduleMasterRow(day_text="วันพฤหัสบดี", time_text="08.00-12.00 น.", doctor_name="แพทย์หญิงมัลลิกา ขวัญเมือง", subspecialty="อายุรแพทย์มะเร็งวิทยา", department="ผู้ป่วยนอก 2/OPD 2"),
+    ],
+    "อายุรแพทย์โรคหัวใจ": [
+        ScheduleMasterRow(day_text="วันพฤหัสบดี", time_text="08.00-16.00 น.", doctor_name="นายแพทย์พงศธร ทั้งสุข", subspecialty="อายุรแพทย์โรคหัวใจ", department="ผู้ป่วยนอก 4/OPD 4"),
+    ],
+    "ระบบประสาทและสมอง": [
+        ScheduleMasterRow(day_text="วันอังคาร-วันพุธ", time_text="08.00-16.00 น.", doctor_name="แพทย์หญิงจิตราภรณ์ วงษ์เพิก", subspecialty="อายุรแพทย์ระบบประสาทและสมอง", department="ผู้ป่วยนอก 4/OPD 4"),
+        ScheduleMasterRow(day_text="วันพฤหัสบดี-วันศุกร์", time_text="08.00-16.00 น.", doctor_name="นายแพทย์วัชเรสร พันธ์พัฒนกุล", subspecialty="อายุรแพทย์ระบบประสาทและสมอง", department="ผู้ป่วยนอก 4/OPD 4"),
+    ],
+    "ออร์โธปิดิคส์บูรณสภาพ": [
+        ScheduleMasterRow(day_text="วันอังคาร", time_text="08.00-16.00 น.", doctor_name="นายแพทย์ฐิตินันท์ ธาราทิพยกุล", subspecialty="ออร์โธปิดิคส์บูรณสภาพ", department="ศูนย์ศัลยกรรมกระดูและข้อ"),
+    ],
+}
+
+
+def _schedule_time_parts(text: str) -> tuple[str, str]:
+    value = str(text or "").strip()
+    match = re.search(r"(\d{1,2}[.:]\d{2}\s*-\s*\d{1,2}[.:]\d{2}\s*น\.)", value)
+    if not match:
+        return value, ""
+    time_text = match.group(1).replace(" - ", "-").replace(" -", "-").replace("- ", "-").strip()
+    day_text = value[:match.start()].strip()
+    return day_text, time_text
+
+
+def _parse_schedule_master_rows(answer: str, *, specialty: str = "", department: str = "") -> tuple[list[ScheduleMasterRow], bool]:
+    rows: list[ScheduleMasterRow] = []
+    has_hidden_rows = False
+    for day_text, doctor_name in _schedule_row_entries_from_text(answer):
+        clean_doctor = str(doctor_name or "").strip()
+        if clean_doctor == "ยังไม่ระบุชื่อแพทย์ในข้อมูล":
+            clean_doctor = ""
+        left_day, time_text = _schedule_time_parts(day_text)
+        rows.append(ScheduleMasterRow(
+            day_text=left_day or day_text,
+            time_text=time_text,
+            doctor_name=clean_doctor,
+            subspecialty=specialty,
+            department=department,
+        ))
+        if not clean_doctor:
+            has_hidden_rows = True
+    return rows, has_hidden_rows
+
+
+def _is_useful_schedule_alias(alias: str) -> bool:
+    value = str(alias or "").strip()
+    compact = _compact_normalize(value)
+    if not value or len(compact) < 2:
+        return False
+    if value.lower() in SCHEDULE_GENERIC_ALIASES or compact in {_compact_normalize(item) for item in SCHEDULE_GENERIC_ALIASES}:
+        return False
+    return True
+
+
+def _doctor_title_parts(doctor_name: str) -> tuple[str, str]:
+    doctor = str(doctor_name or "").strip()
+    for title in ("นายแพทย์", "แพทย์หญิง", "นพ.", "พญ."):
+        if doctor.startswith(title):
+            return title, doctor[len(title):].strip()
+    return "", doctor
+
+
+def _doctor_alias_seed(doctor_name: str) -> set[str]:
+    doctor = str(doctor_name or "").strip()
+    if not doctor:
+        return set()
+    title, stripped = _doctor_title_parts(doctor)
+    aliases = {doctor, doctor.replace(" ", "")}
+    if stripped:
+        aliases.update({stripped, stripped.replace(" ", "")})
+        parts = stripped.split()
+        if parts:
+            first_name = parts[0]
+            aliases.add(first_name)
+            aliases.add(f"หมอ{first_name}")
+            if title:
+                aliases.add(f"{title}{first_name}")
+                aliases.add(f"{title} {first_name}")
+        if len(parts) >= 2:
+            aliases.add(parts[-1])
+    return {alias.strip() for alias in aliases if alias and alias.strip()}
+
+
+def _schedule_master_exact_alias_map() -> dict[str, ScheduleMasterEntry]:
+    alias_map: dict[str, ScheduleMasterEntry] = {}
+    for entry in _schedule_master_entries().values():
+        for alias in [entry.specialty, *entry.aliases]:
+            compact_alias = _compact_normalize(alias)
+            if not compact_alias:
+                continue
+            current = alias_map.get(compact_alias)
+            if current is None or len(entry.specialty) > len(current.specialty):
+                alias_map[compact_alias] = entry
+    return alias_map
+
+
+def _schedule_master_entries() -> dict[str, ScheduleMasterEntry]:
+    entries: dict[str, ScheduleMasterEntry] = {}
+    for row in _schedule_rows():
+        topic = _record_to_candidate(row, 0.95, source="schedule")
+        raw_specialty = str((topic.metadata or {}).get("topic") or topic.question or "").strip()
+        canonical_specialty = SCHEDULE_SOURCE_TO_CANONICAL.get(raw_specialty, raw_specialty)
+        department = str((topic.metadata or {}).get("clinic") or topic.department or "").strip()
+        entry = entries.setdefault(canonical_specialty, ScheduleMasterEntry(
+            specialty=canonical_specialty,
+            department=department,
+            source_id=topic.id,
+        ))
+        if not entry.department and department:
+            entry.department = department
+        if entry.source_id is None:
+            entry.source_id = topic.id
+        alias_values = {
+            canonical_specialty,
+            raw_specialty,
+            str(topic.question or "").strip(),
+            str((topic.metadata or {}).get("specialty") or "").strip(),
+        }
+        alias_values.update(_parse_list_field((topic.metadata or {}).get("aliases")))
+        alias_values.update(SCHEDULE_CANONICAL_ALIASES.get(canonical_specialty, []))
+        if canonical_specialty == "กุมารแพทย์ โรคหัวใจ":
+            alias_values.difference_update({"กุมารแพทย์", "กุมาร", "เด็ก", "หมอเด็ก", "โรคหัวใจ"})
+        elif canonical_specialty == "อายุรแพทย์โรคหัวใจ":
+            alias_values.difference_update({"โรคหัวใจ"})
+        for alias in alias_values:
+            if _is_useful_schedule_alias(alias):
+                entry.aliases.append(str(alias).strip())
+        rows, hidden_rows = _parse_schedule_master_rows(topic.answer, specialty=raw_specialty or canonical_specialty, department=department)
+        entry.rows.extend(rows)
+        entry.has_hidden_rows = entry.has_hidden_rows or hidden_rows
+        image_names = [Path(path).name for path in _parse_list_field((topic.metadata or {}).get("followup_image_paths"))]
+        if canonical_specialty in SCHEDULE_CANONICAL_IMAGE_MAP:
+            image_names.extend(SCHEDULE_CANONICAL_IMAGE_MAP[canonical_specialty])
+        for image_name in image_names:
+            if image_name and image_name not in entry.image_filenames:
+                entry.image_filenames.append(image_name)
+
+    for specialty, override_rows in SCHEDULE_MASTER_ROW_OVERRIDES.items():
+        entry = entries.setdefault(specialty, ScheduleMasterEntry(specialty=specialty))
+        entry.rows = list(override_rows)
+        entry.has_hidden_rows = False
+        entry.aliases.extend(SCHEDULE_CANONICAL_ALIASES.get(specialty, []))
+        entry.aliases.append(specialty)
+        for row in override_rows:
+            if row.department and not entry.department:
+                entry.department = row.department
+        for image_name in SCHEDULE_CANONICAL_IMAGE_MAP.get(specialty, ()):
+            if image_name not in entry.image_filenames:
+                entry.image_filenames.append(image_name)
+
+    for entry in entries.values():
+        entry.aliases = list(dict.fromkeys([alias for alias in entry.aliases if _is_useful_schedule_alias(alias)]))
+        deduped_rows: list[ScheduleMasterRow] = []
+        seen_rows: set[tuple[str, str, str, str, str]] = set()
+        for row in entry.rows:
+            key = (row.day_text, row.time_text, row.doctor_name, row.subspecialty, row.department)
+            if key in seen_rows:
+                continue
+            seen_rows.add(key)
+            deduped_rows.append(row)
+        entry.rows = deduped_rows
+        entry.image_filenames = list(dict.fromkeys(entry.image_filenames))
+    return entries
+
+
+def _schedule_master_doctor_aliases() -> dict[str, set[str]]:
+    entries = _schedule_master_entries()
+    doctor_aliases: dict[str, set[str]] = {}
+    first_name_prefix_counts: dict[str, int] = {}
+    surname_prefix_counts: dict[str, int] = {}
+    doctor_parts: dict[str, tuple[str, str, str]] = {}
+
+    for entry in entries.values():
+        for row in entry.rows:
+            doctor = str(row.doctor_name or "").strip()
+            if not doctor:
+                continue
+            doctor_aliases.setdefault(doctor, set()).update(_doctor_alias_seed(doctor))
+            title, stripped = _doctor_title_parts(doctor)
+            parts = stripped.split()
+            first_name = parts[0] if parts else ""
+            surname = parts[-1] if len(parts) >= 2 else ""
+            doctor_parts[doctor] = (title, first_name, surname)
+            for token, counter in ((first_name, first_name_prefix_counts), (surname, surname_prefix_counts)):
+                compact = _compact_normalize(token)
+                for length in range(3, min(len(compact), 5) + 1):
+                    prefix = compact[:length]
+                    counter[prefix] = counter.get(prefix, 0) + 1
+
+    for doctor, aliases in doctor_aliases.items():
+        title, first_name, surname = doctor_parts.get(doctor, ("", "", ""))
+        for token, counter in ((first_name, first_name_prefix_counts), (surname, surname_prefix_counts)):
+            compact_token = _compact_normalize(token)
+            for length in range(3, min(len(compact_token), 5) + 1):
+                compact_prefix = compact_token[:length]
+                if counter.get(compact_prefix, 0) != 1:
+                    continue
+                prefix = token[:length]
+                aliases.add(prefix)
+                if token == first_name:
+                    aliases.add(f"หมอ{prefix}")
+                    if title:
+                        aliases.add(f"{title}{prefix}")
+                        aliases.add(f"{title} {prefix}")
+        doctor_aliases[doctor] = {alias.strip() for alias in aliases if alias and alias.strip()}
+    return doctor_aliases
+
+
+def _schedule_entry_score(query: str, entry: ScheduleMasterEntry) -> float:
+    qc = _compact_normalize(query)
+    if not qc:
+        return 0.0
+    # BUG 3 FIX: Reject generic words from matching via substring
+    # Note: "อายุรกรรม" and "ผู้สูงอายุ" are valid specialty names and should match
+    generic_words = {
+        "สุขภาพ", "จิต", "ชุมชน", "ตรวจสุขภาพ",
+        "คลินิก", "แพทย์", "หมอ", "นพ", "พญ",
+        "โรงพยาบาล", "แผนก", "บริการ", "ตรวจ", "รักษา",
+    }
+    if qc in generic_words or len(qc) <= 2:
+        return 0.0
+    best = 0.0
+    for alias in [entry.specialty, *entry.aliases]:
+        alias_compact = _compact_normalize(alias)
+        if not alias_compact:
+            continue
+        if qc == alias_compact:
+            best = max(best, 1.0)
+        elif alias_compact in qc and len(alias_compact) >= 2:
+            # BUG 3 FIX: Only allow substring match if query is long enough
+            if len(qc) >= 5:
+                best = max(best, 0.97)
+        elif qc in alias_compact and len(qc) >= 3:
+            # BUG 3 FIX: Only allow substring match if query is long enough
+            if len(qc) >= 4:
+                best = max(best, 0.94)
+    return best
+
+
+def _find_schedule_master_entry(query: str) -> ScheduleMasterEntry | None:
+    best_entry: ScheduleMasterEntry | None = None
+    best_score = 0.0
+    for entry in _schedule_master_entries().values():
+        score = _schedule_entry_score(query, entry)
+        if score > best_score:
+            best_entry = entry
+            best_score = score
+    return best_entry if best_score >= 0.94 else None
+
+
+def _schedule_master_exact_alias_map() -> dict[str, ScheduleMasterEntry]:
+    alias_map: dict[str, ScheduleMasterEntry] = {}
+    for entry in _schedule_master_entries().values():
+        for alias in [entry.specialty, *entry.aliases]:
+            compact_alias = _compact_normalize(alias)
+            if not compact_alias:
+                continue
+            current = alias_map.get(compact_alias)
+            if current is None or len(entry.specialty) > len(current.specialty):
+                alias_map[compact_alias] = entry
+    return alias_map
+
+
+def _schedule_entry_score(query: str, entry: ScheduleMasterEntry) -> float:
+    qc = _compact_normalize(query)
+    if not qc:
+        return 0.0
+    generic_words = {
+        "สุขภาพ", "จิต", "ชุมชน", "คลินิก", "แพทย์", "หมอ", "นพ", "พญ",
+        "โรงพยาบาล", "แผนก", "บริการ", "ตรวจ", "รักษา",
+    }
+    if qc in generic_words or len(qc) <= 2:
+        return 0.0
+    best = 0.0
+    for alias in [entry.specialty, *entry.aliases]:
+        alias_compact = _compact_normalize(alias)
+        if not alias_compact:
+            continue
+        if qc == alias_compact:
+            best = max(best, 1.0)
+        elif alias_compact in qc and len(alias_compact) >= 2:
+            if len(qc) >= 5:
+                best = max(best, 0.97)
+        elif qc in alias_compact and len(qc) >= 3:
+            if len(qc) >= 4:
+                best = max(best, 0.94)
+    return best
+
+
+def _find_schedule_master_entry(query: str) -> ScheduleMasterEntry | None:
+    qc = _compact_normalize(query)
+    if not qc:
+        return None
+
+    exact_entry = _schedule_master_exact_alias_map().get(qc)
+    if exact_entry is not None:
+        return exact_entry
+
+    best_entry: ScheduleMasterEntry | None = None
+    best_score = 0.0
+    for entry in _schedule_master_entries().values():
+        score = _schedule_entry_score(query, entry)
+        if score > best_score:
+            best_entry = entry
+            best_score = score
+    return best_entry if best_score >= 0.94 else None
+
+
+def _build_schedule_master_attachments(entry: ScheduleMasterEntry) -> list[Attachment]:
+    attachments: list[Attachment] = []
+    total_images = len(entry.image_filenames)
+    for image_name in entry.image_filenames:
+        if not image_name:
+            continue
+        label = f"รูปตารางแพทย์ {entry.specialty}"
+        if total_images > 1:
+            label = f"รูปตารางแพทย์ {entry.specialty} {Path(image_name).stem}"
+        attachments.append(Attachment(
+            type="image",
+            label=label,
+            url=f"/assets/schedule/{image_name}",
+            filename=image_name,
+        ))
+    return _dedupe_attachments(attachments)
+
+
+def _format_schedule_master_answer(entry: ScheduleMasterEntry, day_filter: str | None = None) -> str:
+    rows = list(entry.rows)
+    if day_filter:
+        rows = [row for row in rows if day_filter in row.day_text]
+        if not rows:
+            return (
+                f"ไม่พบตารางออกตรวจของ {entry.specialty} ในวัน{day_filter} ในระบบปัจจุบัน\n"
+                "กรุณาดูรูปตารางประกอบหรือเลือกสาขาอื่นได้เลยค่ะ"
+            )
+
+    body_lines: list[str] = []
+    hidden_rows = False
+    for row in rows:
+        if not row.doctor_name:
+            hidden_rows = True
+            continue
+        slot_text = f"{row.day_text} {row.time_text}".strip()
+        detail_parts: list[str] = []
+        if row.subspecialty and row.subspecialty not in {entry.specialty, "จักษุแพทย์", "อายุรแพทย์ทั่วไป"}:
+            detail_parts.append(row.subspecialty)
+        if row.department and entry.specialty == "อายุรกรรม":
+            detail_parts.append(row.department)
+        suffix = f" ({', '.join(dict.fromkeys(detail_parts))})" if detail_parts else ""
+        body_lines.append(f"- {slot_text} : {row.doctor_name}{suffix}")
+
+    if hidden_rows or entry.has_hidden_rows:
+        body_lines.append(SCHEDULE_UNNAMED_PUBLIC_NOTICE)
+
+    header = entry.specialty
+    if entry.department and entry.specialty not in {"อายุรกรรม", "ทั่วไป"}:
+        header = f"{entry.specialty} ({entry.department})"
+    return clean_user_visible_answer("\n".join([header, *body_lines]))
+
+
+def _format_schedule_master_answer(entry: ScheduleMasterEntry, day_filter: str | None = None) -> str:
+    rows = list(entry.rows)
+    if day_filter:
+        rows = [row for row in rows if day_filter in row.day_text]
+        if not rows:
+            return (
+                f"ไม่พบตารางออกตรวจของ {entry.specialty} ในวัน{day_filter} ในระบบปัจจุบัน\n"
+                "กรุณาดูรูปตารางประกอบหรือเลือกสาขาอื่นได้เลยค่ะ"
+            )
+
+    body_lines: list[str] = []
+    hidden_rows = False
+    detail_entries = {"อายุรแพทย์คลินิกผู้สูงอายุ", "อายุรแพทย์มะเร็งวิทยา", "ระบบประสาทและสมอง"}
+    for row in rows:
+        if not row.doctor_name:
+            hidden_rows = True
+            continue
+        slot_text = f"{row.day_text} {row.time_text}".strip()
+        detail_parts: list[str] = []
+        if row.subspecialty and (entry.specialty in detail_entries or row.subspecialty not in {entry.specialty, "จักษุแพทย์", "อายุรแพทย์ทั่วไป"}):
+            detail_parts.append(row.subspecialty)
+        if row.department and entry.specialty in {"อายุรกรรม", *detail_entries}:
+            detail_parts.append(row.department)
+        suffix = f" ({', '.join(dict.fromkeys(detail_parts))})" if detail_parts else ""
+        body_lines.append(f"- {slot_text} : {row.doctor_name}{suffix}")
+
+    if hidden_rows or entry.has_hidden_rows:
+        body_lines.append(SCHEDULE_UNNAMED_PUBLIC_NOTICE)
+
+    if entry.specialty == "สุขภาพจิตชุมชน" and rows and len(body_lines) == 1:
+        row = rows[0]
+        return clean_user_visible_answer(
+            "\n".join([
+                f"{row.doctor_name} ออกตรวจเฉพาะทางสุขภาพจิตชุมชน ที่{row.department}",
+                f"- {row.day_text} {row.time_text}".strip(),
+            ])
+        )
+
+    header = entry.specialty
+    if entry.department and entry.specialty not in {"อายุรกรรม", "ทั่วไป", "สุขภาพจิตชุมชน", "อายุรแพทย์คลินิกผู้สูงอายุ", "อายุรแพทย์มะเร็งวิทยา", "ระบบประสาทและสมอง"}:
+        header = f"{entry.specialty} ({entry.department})"
+    return clean_user_visible_answer("\n".join([header, *body_lines]))
+
+
+def _format_schedule_master_answer(entry: ScheduleMasterEntry, day_filter: str | None = None) -> str:
+    rows = list(entry.rows)
+    if day_filter:
+        rows = [row for row in rows if day_filter in row.day_text]
+        if not rows:
+            return (
+                f"ไม่พบตารางออกตรวจของ {entry.specialty} ในวัน{day_filter} ในระบบปัจจุบัน\n"
+                "กรุณาดูรูปตารางประกอบหรือเลือกสาขาอื่นได้เลยค่ะ"
+            )
+
+    body_lines: list[str] = []
+    hidden_rows = False
+    detail_entries = {
+        "อายุรแพทย์คลินิกผู้สูงอายุ",
+        "อายุรแพทย์มะเร็งวิทยา",
+        "ระบบประสาทและสมอง",
+        "อายุรแพทย์โรคหัวใจ",
+    }
+    for row in rows:
+        if not row.doctor_name:
+            hidden_rows = True
+            continue
+        slot_text = f"{row.day_text} {row.time_text}".strip()
+        detail_parts: list[str] = []
+        if row.subspecialty and (entry.specialty in detail_entries or row.subspecialty not in {entry.specialty, "จักษุแพทย์", "อายุรแพทย์ทั่วไป"}):
+            detail_parts.append(row.subspecialty)
+        if row.department and entry.specialty in {"อายุรกรรม", *detail_entries}:
+            detail_parts.append(row.department)
+        suffix = f" ({', '.join(dict.fromkeys(detail_parts))})" if detail_parts else ""
+        body_lines.append(f"- {slot_text} : {row.doctor_name}{suffix}")
+
+    if hidden_rows or entry.has_hidden_rows:
+        body_lines.append(SCHEDULE_UNNAMED_PUBLIC_NOTICE)
+
+    if entry.specialty == "สุขภาพจิตชุมชน" and rows and len(body_lines) == 1:
+        row = rows[0]
+        return clean_user_visible_answer(
+            "\n".join([
+                f"{row.doctor_name} ออกตรวจเฉพาะทางสุขภาพจิตชุมชน ที่{row.department}",
+                f"- {row.day_text} {row.time_text}".strip(),
+            ])
+        )
+
+    header = entry.specialty
+    if entry.department and entry.specialty not in {
+        "อายุรกรรม",
+        "ทั่วไป",
+        "สุขภาพจิตชุมชน",
+        "อายุรแพทย์คลินิกผู้สูงอายุ",
+        "อายุรแพทย์มะเร็งวิทยา",
+        "ระบบประสาทและสมอง",
+        "อายุรแพทย์โรคหัวใจ",
+    }:
+        header = f"{entry.specialty} ({entry.department})"
+    return clean_user_visible_answer("\n".join([header, *body_lines]))
+
+
+def _match_schedule_master_doctor(query: str) -> dict[str, Any] | None:
+    qc = _compact_normalize(query)
+    if not qc:
+        return None
+
+    # BUG 3 FIX: Add stricter matching rules to prevent generic words from matching doctor names
+    # Generic words that should NOT match doctor names
+    # Note: "อายุรกรรม" and "ผู้สูงอายุ" are valid specialty names and should match
+    generic_words = {
+        "สุขภาพ", "จิต", "ชุมชน", "ตรวจสุขภาพ",
+        "คลินิก", "แพทย์", "หมอ", "นพ", "พญ",
+        "โรงพยาบาล", "แผนก", "บริการ", "ตรวจ", "รักษา",
+    }
+    if qc in generic_words or len(qc) <= 2:
+        logger.info("🚫 Doctor match rejected: generic word or too short (query='%s')", query[:40])
+        return None
+
+    # Check if query has explicit doctor intent markers
+    doctor_intent_markers = {"หมอ", "แพทย์", "นพ", "พญ", "นายแพทย์", "แพทย์หญิง"}
+    has_explicit_doctor_intent = any(marker in query for marker in doctor_intent_markers)
+
+    doctor_aliases = _schedule_master_doctor_aliases()
+    matches: list[tuple[str, float]] = []
+    for doctor_name, aliases in doctor_aliases.items():
+        best_score = 0.0
+        for alias in aliases:
+            alias_compact = _compact_normalize(alias)
+            if len(alias_compact) < 3:
+                continue
+            # BUG 3 FIX: Stricter scoring - require higher confidence for partial matches
+            if qc == alias_compact:
+                best_score = max(best_score, 1.0)
+            elif alias_compact in qc and len(alias_compact) >= 4:
+                # Only allow partial match if query is long enough or has explicit doctor intent
+                if len(qc) >= 6 or has_explicit_doctor_intent:
+                    best_score = max(best_score, 0.97)
+            elif qc in alias_compact and len(qc) >= 4:
+                # Only allow if query is reasonably long
+                if len(qc) >= 5 or has_explicit_doctor_intent:
+                    best_score = max(best_score, 0.94)
+        if best_score:
+            matches.append((doctor_name, best_score))
+
+    if not matches:
+        logger.info("🚫 Doctor match failed: no matches found (query='%s')", query[:40])
+        return None
+
+    matches.sort(key=lambda item: (-item[1], item[0]))
+    top_score = matches[0][1]
+    # BUG 3 FIX: Require higher confidence threshold to avoid false positives
+    if top_score < 0.94:
+        logger.info("🚫 Doctor match rejected: score too low %.2f (query='%s')", top_score, query[:40])
+        return None
+    top_doctors = [doctor for doctor, score in matches if score >= top_score - 0.01]
+    if len(top_doctors) > 1:
+        logger.info("⚠️  Doctor match ambiguous: %d doctors (query='%s')", len(top_doctors), query[:40])
+        return {"ambiguous_doctors": top_doctors[:6]}
+
+    doctor_name = top_doctors[0]
+    doctor_rows: list[dict[str, Any]] = []
+    for entry in _schedule_master_entries().values():
+        for row in entry.rows:
+            if str(row.doctor_name or "").strip() == doctor_name:
+                doctor_rows.append({"entry": entry, "row": row})
+    logger.info("✅ Doctor match found: %s with %d rows (query='%s')", doctor_name, len(doctor_rows), query[:40])
+    return {"doctor": doctor_name, "rows": doctor_rows}
+
+
+def _format_schedule_master_doctor_answer(match: dict[str, Any]) -> str:
+    doctor_name = str(match.get("doctor") or "").strip()
+    rows = list(match.get("rows") or [])
+    if not doctor_name or not rows:
+        return ""
+
+    grouped: dict[str, list[ScheduleMasterRow]] = {}
+    specialty_meta: dict[str, tuple[str, str]] = {}
+    for item in rows:
+        entry: ScheduleMasterEntry = item["entry"]
+        row: ScheduleMasterRow = item["row"]
+        specialty_label = row.subspecialty or entry.specialty
+        grouped.setdefault(specialty_label, []).append(row)
+        specialty_meta.setdefault(specialty_label, (entry.specialty, row.department or entry.department))
+
+    lines: list[str] = []
+    if len(grouped) == 1:
+        specialty_label = next(iter(grouped))
+        root_specialty, department = specialty_meta[specialty_label]
+        heading = f"{doctor_name} ออกตรวจเฉพาะทาง{specialty_label}"
+        if department:
+            heading += f" ที่{department}"
+        if root_specialty != specialty_label and root_specialty:
+            heading += f" ในหมวด{root_specialty}"
+        lines.append(heading)
+        for row in grouped[specialty_label]:
+            lines.append(f"- {row.day_text} {row.time_text}".strip())
+    else:
+        lines.append(f"{doctor_name} มีตารางออกตรวจดังนี้")
+        for specialty_label, specialty_rows in grouped.items():
+            root_specialty, department = specialty_meta[specialty_label]
+            header = specialty_label
+            if department:
+                header += f" ที่{department}"
+            if root_specialty and root_specialty != specialty_label:
+                header += f" ({root_specialty})"
+            lines.append(header)
+            for row in specialty_rows:
+                lines.append(f"- {row.day_text} {row.time_text}".strip())
+    return clean_user_visible_answer("\n".join(lines))
+
+
+def _schedule_master_attachments_for_doctor(match: dict[str, Any]) -> list[Attachment]:
+    attachments: list[Attachment] = []
+    seen_specialties: set[str] = set()
+    for item in match.get("rows", []):
+        entry: ScheduleMasterEntry = item["entry"]
+        if entry.specialty in seen_specialties:
+            continue
+        seen_specialties.add(entry.specialty)
+        attachments.extend(_build_schedule_master_attachments(entry))
+    return _dedupe_attachments(attachments)
 
 
 def _topic_alias_candidates(query: str) -> list[RetrievalCandidate]:
@@ -1518,35 +2409,41 @@ def _topic_follow_up_buttons(topic: RetrievalCandidate) -> list[str]:
     # Determine which slots are relevant
     is_schedule = canonical_cat in {"\u0e15\u0e32\u0e23\u0e32\u0e07\u0e41\u0e1e\u0e17\u0e22\u0e4c\u0e41\u0e25\u0e30\u0e40\u0e27\u0e25\u0e32\u0e17\u0e33\u0e01\u0e32\u0e23"} or raw_category in {"\u0e19\u0e31\u0e14\u0e2b\u0e21\u0e32\u0e22\u0e41\u0e25\u0e30\u0e15\u0e32\u0e23\u0e32\u0e07\u0e41\u0e1e\u0e17\u0e22\u0e4c"}
     is_job = canonical_cat == "\u0e01\u0e25\u0e38\u0e48\u0e21\u0e07\u0e32\u0e19\u0e1a\u0e38\u0e04\u0e04\u0e25" or raw_category in {"\u0e15\u0e34\u0e14\u0e15\u0e48\u0e2d\u0e2b\u0e19\u0e48\u0e27\u0e22\u0e07\u0e32\u0e19\u0e40\u0e09\u0e1e\u0e32\u0e30\u0e41\u0e25\u0e30\u0e2a\u0e21\u0e31\u0e04\u0e23\u0e07\u0e32\u0e19"}
-    is_health_check = canonical_cat in {"\u0e15\u0e23\u0e27\u0e08\u0e2a\u0e38\u0e02\u0e20\u0e32\u0e1e\u0e23\u0e32\u0e22\u0e1a\u0e38\u0e04\u0e04\u0e25", "\u0e15\u0e23\u0e27\u0e08\u0e2a\u0e38\u0e02\u0e20\u0e32\u0e1e\u0e2d\u0e07\u0e04\u0e4c\u0e01\u0e23\u0e41\u0e25\u0e30\u0e2a\u0e34\u0e17\u0e18\u0e34\u0e40\u0e1a\u0e34\u0e01\u0e08\u0e48\u0e32\u0e22"}
+    is_health_check = canonical_cat in {
+        "\u0e15\u0e23\u0e27\u0e08\u0e2a\u0e38\u0e02\u0e20\u0e32\u0e1e\u0e23\u0e32\u0e22\u0e1a\u0e38\u0e04\u0e04\u0e25",
+        "\u0e15\u0e23\u0e27\u0e08\u0e2a\u0e38\u0e02\u0e20\u0e32\u0e1e\u0e2d\u0e07\u0e04\u0e4c\u0e01\u0e23\u0e41\u0e25\u0e30\u0e2a\u0e34\u0e17\u0e18\u0e34\u0e40\u0e1a\u0e34\u0e01\u0e08\u0e48\u0e32\u0e22",
+        "\u0e15\u0e23\u0e27\u0e08\u0e2a\u0e38\u0e02\u0e20\u0e32\u0e1e\u0e41\u0e25\u0e30\u0e43\u0e1a\u0e23\u0e31\u0e1a\u0e23\u0e2d\u0e07\u0e41\u0e1e\u0e17\u0e22\u0e4c",
+        "\u0e01\u0e32\u0e23\u0e02\u0e2d\u0e40\u0e2d\u0e01\u0e2a\u0e32\u0e23\u0e17\u0e32\u0e07\u0e01\u0e32\u0e23\u0e41\u0e1e\u0e17\u0e22\u0e4c",
+    }
     is_vaccine = canonical_cat == "\u0e27\u0e31\u0e04\u0e0b\u0e35\u0e19" or canonical_cat == "\u0e2a\u0e27\u0e31\u0e2a\u0e14\u0e34\u0e01\u0e32\u0e23\u0e27\u0e31\u0e04\u0e0b\u0e35\u0e19\u0e19\u0e31\u0e01\u0e28\u0e36\u0e01\u0e29\u0e32"
-    has_image = bool(_slot_value(topic, "image"))
-    has_link = bool(_slot_value(topic, "link"))
-
     buttons: list[str] = []
     if is_schedule:
-        if has_image:
-            buttons.append("มีรูปไหม")
-        buttons += ["ดูตารางสาขาอื่น", "เลือกแผนกตารางแพทย์", "เวลาทำการแผนกผู้ป่วยนอก"]
+        buttons += ["ค้นหาตามเฉพาะทาง", "ดูตารางสาขาอื่น", "เวลาทำการแผนกผู้ป่วยนอก"]
         back_label = f"\u0e01\u0e25\u0e31\u0e1a\u0e44\u0e1b\u0e2b\u0e21\u0e27\u0e14\u0e19\u0e31\u0e14\u0e2b\u0e21\u0e32\u0e22\u0e41\u0e25\u0e30\u0e15\u0e32\u0e23\u0e32\u0e07\u0e41\u0e1e\u0e17\u0e22\u0e4c"
     elif is_job:
-        buttons += ["\u0e15\u0e34\u0e14\u0e15\u0e48\u0e2d\u0e17\u0e35\u0e48\u0e44\u0e2b\u0e19"]
+        if _slot_value(topic, "contact"):
+            buttons.append("ติดต่อที่ไหน")
         back_label = f"\u0e01\u0e25\u0e31\u0e1a\u0e44\u0e1b\u0e2b\u0e21\u0e27\u0e14\u0e15\u0e34\u0e14\u0e15\u0e48\u0e2d\u0e2b\u0e19\u0e48\u0e27\u0e22\u0e07\u0e32\u0e19\u0e40\u0e09\u0e1e\u0e32\u0e30\u0e41\u0e25\u0e30\u0e2a\u0e21\u0e31\u0e04\u0e23\u0e07\u0e32\u0e19"
     elif is_vaccine:
-        buttons += ["\u0e23\u0e32\u0e04\u0e32\u0e40\u0e17\u0e48\u0e32\u0e44\u0e2b\u0e23\u0e48", "\u0e15\u0e34\u0e14\u0e15\u0e48\u0e2d\u0e17\u0e35\u0e48\u0e44\u0e2b\u0e19", "\u0e40\u0e1b\u0e34\u0e14\u0e27\u0e31\u0e19\u0e44\u0e2b\u0e19"]
+        if _slot_value(topic, "price"):
+            buttons.append("ราคาเท่าไหร่")
+        if _slot_value(topic, "contact"):
+            buttons.append("ติดต่อที่ไหน")
+        if _slot_value(topic, "hours"):
+            buttons.append("เปิดวันไหน")
         back_label = f"\u0e01\u0e25\u0e31\u0e1a\u0e44\u0e1b\u0e2b\u0e21\u0e27\u0e14\u0e27\u0e31\u0e04\u0e0b\u0e35\u0e19\u0e41\u0e25\u0e30\u0e1a\u0e23\u0e34\u0e01\u0e32\u0e23\u0e1c\u0e39\u0e49\u0e1b\u0e48\u0e27\u0e22\u0e19\u0e2d\u0e01"
     elif is_health_check:
-        buttons += ["\u0e23\u0e32\u0e04\u0e32\u0e40\u0e17\u0e48\u0e32\u0e44\u0e2b\u0e23\u0e48", "\u0e15\u0e34\u0e14\u0e15\u0e48\u0e2d\u0e17\u0e35\u0e48\u0e44\u0e2b\u0e19", "\u0e40\u0e1b\u0e34\u0e14\u0e27\u0e31\u0e19\u0e44\u0e2b\u0e19"]
-        if has_image:
-            buttons.append("\u0e21\u0e35\u0e23\u0e39\u0e1b\u0e44\u0e2b\u0e21")
+        buttons += ["เวลาตรวจสุขภาพ", "โปรแกรมตรวจสุขภาพ", "ใบรับรองแพทย์"]
         back_label = f"\u0e01\u0e25\u0e31\u0e1a\u0e44\u0e1b\u0e2b\u0e21\u0e27\u0e14\u0e15\u0e23\u0e27\u0e08\u0e2a\u0e38\u0e02\u0e20\u0e32\u0e1e\u0e41\u0e25\u0e30\u0e43\u0e1a\u0e23\u0e31\u0e1a\u0e23\u0e2d\u0e07\u0e41\u0e1e\u0e17\u0e22\u0e4c"
     else:
-        buttons += ["\u0e23\u0e32\u0e04\u0e32\u0e40\u0e17\u0e48\u0e32\u0e44\u0e2b\u0e23\u0e48", "\u0e15\u0e34\u0e14\u0e15\u0e48\u0e2d\u0e17\u0e35\u0e48\u0e44\u0e2b\u0e19", "\u0e40\u0e1b\u0e34\u0e14\u0e27\u0e31\u0e19\u0e44\u0e2b\u0e19", "\u0e40\u0e02\u0e49\u0e32\u0e44\u0e14\u0e49\u0e40\u0e25\u0e22\u0e44\u0e2b\u0e21"]
-        if has_image:
-            buttons.append("\u0e21\u0e35\u0e23\u0e39\u0e1b\u0e44\u0e2b\u0e21")
-        if has_link:
-            buttons.append("\u0e21\u0e35\u0e25\u0e34\u0e07\u0e01\u0e4c\u0e44\u0e2b\u0e21")
-        # Build back label from parent theme
+        if _slot_value(topic, "price"):
+            buttons.append("ราคาเท่าไหร่")
+        if _slot_value(topic, "contact"):
+            buttons.append("ติดต่อที่ไหน")
+        if _slot_value(topic, "hours"):
+            buttons.append("เปิดวันไหน")
+        if _slot_value(topic, "walkin"):
+            buttons.append("เข้าได้เลยไหม")
         if parent_theme:
             back_label = f"\u0e01\u0e25\u0e31\u0e1a\u0e44\u0e1b\u0e2b\u0e21\u0e27\u0e14{parent_theme}"
         else:
@@ -1560,6 +2457,8 @@ def _category_action_buttons(category: str, candidates: list[RetrievalCandidate]
     # Use MAIN_THEME_CHILDREN if category is a main-theme label
     if category in MAIN_THEME_CHILDREN:
         return list(MAIN_THEME_CHILDREN[category])
+    if category == "ตรวจสุขภาพรายบุคคล":
+        return ["เวลาตรวจสุขภาพ", "โปรแกรมตรวจสุขภาพ", "ใบรับรองแพทย์", "กลับหน้าหลัก"]
     if category == "ตารางแพทย์และเวลาทำการ":
         return ["ตารางแพทย์ออกตรวจ", "เวลาทำการแผนกผู้ป่วยนอก", "กลับไปหมวดนัดหมายและตารางแพทย์"]
 
@@ -1615,7 +2514,7 @@ def _answer_from_topic_follow_up(query: str, session: SessionMemory) -> Retrieva
     return topic if _is_follow_up_query(query) else None
 
 
-GROUNDED_LLM_FALLBACK_TEXT = "ไม่พบข้อมูลนี้ในระบบปัจจุบัน กรุณาติดต่อโรงพยาบาลมหาวิทยาลัยพะเยาเพื่อสอบถามเพิ่มเติม"
+GROUNDED_LLM_FALLBACK_TEXT = _official_fallback_answer()
 
 
 def _candidate_title(candidate: RetrievalCandidate | None) -> str:
@@ -1631,8 +2530,6 @@ def _kb_context_blob(candidates: list[RetrievalCandidate]) -> str:
         lines.append(f"category={cand.category}")
         lines.append(f"title={_candidate_title(cand)}")
         lines.append(f"answer={cand.answer}")
-        if cand.notes:
-            lines.append(f"notes={cand.notes}")
         if cand.department:
             lines.append(f"department={cand.department}")
         if cand.contact:
@@ -1874,6 +2771,48 @@ class HandoffLiveMessageRequest(BaseModel):
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
+def _dedupe_attachments(attachments: list[Attachment]) -> list[Attachment]:
+    seen: set[tuple[str, str]] = set()
+    cleaned: list[Attachment] = []
+    for attachment in attachments or []:
+        url = str(attachment.url or "").strip()
+        if not url or ":\\" in url:
+            continue
+        key = (str(attachment.type or "image"), url)
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(Attachment(
+            type=attachment.type or "image",
+            label=str(attachment.label or "").strip(),
+            url=url,
+            filename=str(attachment.filename or "").strip(),
+        ))
+    return cleaned
+
+
+def _normalize_response_buttons(response: ChatResponse) -> list[str]:
+    if response.reason == "emergency_redirect":
+        buttons = [str(button).strip() for button in response.action_buttons if str(button).strip()]
+        return list(dict.fromkeys(buttons)) or ["ฉุกเฉิน 1669", "ติดต่อแผนกฉุกเฉิน"]
+    if response.route == "fallback":
+        return list(FALLBACK_ACTION_BUTTONS)
+
+    selected_category = str(response.selected_category or "").strip()
+    source_topic = _find_candidate_by_id(response.source_id) if response.source_id else None
+    source_category = _canonical_category_for_candidate(source_topic, source_topic.question if source_topic else "") if source_topic else ""
+
+    if selected_category == "ตารางแพทย์และเวลาทำการ" or source_category == "ตารางแพทย์และเวลาทำการ":
+        if response.route == "answer":
+            return ["ค้นหาตามเฉพาะทาง", "ดูตารางสาขาอื่น", "เวลาทำการแผนกผู้ป่วยนอก", "กลับไปหมวดนัดหมายและตารางแพทย์"]
+    if selected_category in {"ตรวจสุขภาพรายบุคคล", "ตรวจสุขภาพองค์กรและสิทธิเบิกจ่าย", "ตรวจสุขภาพและใบรับรองแพทย์"} or source_category in {"ตรวจสุขภาพรายบุคคล", "ตรวจสุขภาพองค์กรและสิทธิเบิกจ่าย"}:
+        if response.route == "answer":
+            return ["เวลาตรวจสุขภาพ", "โปรแกรมตรวจสุขภาพ", "ใบรับรองแพทย์", "กลับไปหมวดตรวจสุขภาพและใบรับรองแพทย์"]
+
+    buttons = [str(button).strip() for button in response.action_buttons if str(button).strip()]
+    return list(dict.fromkeys(buttons))
+
+
 def _should_create_handoff(response: ChatResponse) -> bool:
     if response.handoff_required:
         return True
@@ -1893,6 +2832,11 @@ def _finalize_chat_response(req: ChatRequest, session: SessionMemory, query: str
         response.selected_category = _canonical_category_for_candidate(_find_candidate_by_id(response.source_id), query) or response.selected_category
     else:
         response.selected_category = _canonical_category_from_values(response.selected_category, None, query) or response.selected_category
+
+    response.answer = clean_user_visible_answer(response.answer)
+    response.attachments = _dedupe_attachments(response.attachments)
+    if not response.answer and response.route == "fallback":
+        response.answer = _official_fallback_answer()
     # ── Fallback tracking & auto-reset ────────────────────────────────────
     # Safe reasons that must NOT be overwritten by auto-reset
     _safe_fallback_reasons = {"unsupported_specific_query", "chat_unhandled_exception", "safe_unsupported_fallback", "emergency_redirect"}
@@ -1916,9 +2860,7 @@ def _finalize_chat_response(req: ChatRequest, session: SessionMemory, query: str
             logger.info("✅ Session %s fallback_count reset from %d to 0 (route=%s)", session.session_id[:12], session.fallback_count, response.route)
         session.fallback_count = 0
 
-    # ── Ensure fallback responses always show main theme buttons ──────────
-    if response.route == "fallback" and not response.action_buttons:
-        response.action_buttons = list(MAIN_THEME_BUTTONS)
+    response.action_buttons = _normalize_response_buttons(response)
 
     admin_reply = fetch_session_responses(ANALYTICS_DB_PATH, req.session_id, limit=1)
     if admin_reply:
@@ -2279,9 +3221,11 @@ def _format_schedule_answer(topic: RetrievalCandidate, day_filter: str | None = 
         return format_direct_answer(topic)
 
     header = lines[0].strip()
-    normalized_rows: list[str] = []
+    normalized_rows: list[str] = list(SCHEDULE_TOPIC_ROW_OVERRIDES.get(specialty, []))
     body_lines = lines[1:]
-    if not body_lines:
+    if normalized_rows:
+        body_lines = []
+    if not normalized_rows and not body_lines:
         for item in _parse_list_field((topic.metadata or {}).get("followup_hours")):
             if item:
                 normalized_rows.append(f"- {item} : ยังไม่ระบุชื่อแพทย์ในข้อมูล")
@@ -2317,12 +3261,12 @@ def _format_schedule_answer(topic: RetrievalCandidate, day_filter: str | None = 
             section_title = f"ตารางออกตรวจวัน{day_filter}:"
         if specialty and department and department not in header:
             final_header = f"{specialty} — {department}"
-        return final_header + "\n\n" + section_title + "\n" + "\n".join(normalized_rows)
+        return clean_user_visible_answer(final_header + "\n\n" + section_title + "\n" + "\n".join(normalized_rows))
     if specialty and department and department not in header:
         final_header = f"{specialty} — {department}"
     if normalized_rows:
         return final_header + "\n\nตารางออกตรวจ:\n" + "\n".join(normalized_rows)
-    return final_header
+    return clean_user_visible_answer(final_header)
 
 
 def _build_attachments_for_topic(topic: RetrievalCandidate, label_prefix: str = "รูปตารางแพทย์") -> list[Attachment]:
@@ -2341,7 +3285,8 @@ def _build_attachments_for_topic(topic: RetrievalCandidate, label_prefix: str = 
                 url=url,
                 filename=filename,
             ))
-    return attachments
+    # BUG 5 FIX: Dedupe attachments before returning
+    return _dedupe_attachments(attachments)
 
 
 def _build_health_check_attachments() -> list[Attachment]:
@@ -2357,7 +3302,42 @@ def _build_health_check_attachments() -> list[Attachment]:
                 url=f"/assets/health-check/{img_file.name}",
                 filename=img_file.name,
             ))
-    return attachments
+    # BUG 5 FIX: Dedupe attachments before returning
+    return _dedupe_attachments(attachments)
+
+
+def _attachments_for_answer_topic(topic: RetrievalCandidate) -> list[Attachment]:
+    attachments = _build_attachments_for_topic(topic)
+    raw_cat = str(topic.category or "").strip()
+    canonical_cat = _canonical_category_for_candidate(topic, topic.question) or raw_cat
+    if canonical_cat in {"ตรวจสุขภาพรายบุคคล", "ตรวจสุขภาพองค์กรและสิทธิเบิกจ่าย", "การขอเอกสารทางการแพทย์"}:
+        topic_text = _normalize(str(topic.question or "") + " " + str(topic.subcategory or ""))
+        if any(marker in topic_text for marker in ("โปรแกรมตรวจสุขภาพ", "ตรวจสุขภาพ", "ใบรับรองแพทย์", "ใบรับรอง")):
+            if not attachments:
+                attachments = _build_health_check_attachments()
+    # BUG 5 FIX: Dedupe attachments before returning (in case multiple sources were combined)
+    return _dedupe_attachments(attachments)
+
+
+def _health_check_shortcut_candidate(query: str) -> tuple[RetrievalCandidate, str] | None:
+    query_text = _normalize(query)
+    if query_text == _normalize("เวลาตรวจสุขภาพ"):
+        topic_id, selected_category = "qa-0050", "ตรวจสุขภาพรายบุคคล"
+    elif query_text == _normalize("โปรแกรมตรวจสุขภาพ"):
+        topic_id, selected_category = "qa-0049", "ตรวจสุขภาพรายบุคคล"
+    elif query_text == _normalize("ใบรับรองแพทย์"):
+        topic_id, selected_category = "qa-0053", "การขอเอกสารทางการแพทย์"
+    else:
+        shortcut = HEALTH_CHECK_SHORTCUTS.get(str(query or "").strip())
+        if shortcut is None:
+            return None
+        topic_id, selected_category = shortcut
+    if not topic_id:
+        return None
+    topic = _find_candidate_by_id(topic_id)
+    if topic is None:
+        return None
+    return topic, selected_category
 
 
 def _chat_impl(req: ChatRequest) -> ChatResponse:
@@ -2372,14 +3352,10 @@ def _chat_impl(req: ChatRequest) -> ChatResponse:
         logger.warning("⚠️  KB not ready — returning friendly fallback for query: %s", query)
         return ChatResponse(
             route="fallback",
-            answer=(
-                "ขออภัยครับ/ค่ะ ขณะนี้ฐานข้อมูลโรงพยาบาลยังไม่พร้อมใช้งาน "
-                "กรุณาติดต่อผู้ดูแลระบบเพื่อ build ฐานความรู้ก่อน "
-                "หรือโทรสายด่วน 054-466666 ต่อ 7221/7222 ครับ/ค่ะ"
-            ),
+            answer=_official_fallback_answer(),
             confidence=0.0,
             reason="kb_not_ready",
-            action_buttons=GUIDE_ITEMS[:6],
+            action_buttons=list(FALLBACK_ACTION_BUTTONS),
         )
 
     session = state.get_session(req.session_id)
@@ -2422,6 +3398,35 @@ def _chat_impl(req: ChatRequest) -> ChatResponse:
             )
             return _finalize_chat_response(req, session, raw_query, response)
 
+    if _normalize(raw_query) == _normalize("ตรวจสุขภาพ") or _normalize(wrapper_stripped_query) == _normalize("ตรวจสุขภาพ"):
+        buttons = ["ค้นหาตามเฉพาะทาง", "ดูตารางสาขาอื่น", "เวลาทำการแผนกผู้ป่วยนอก", "กลับไปหมวดนัดหมายและตารางแพทย์"]
+        answer = (
+            "ตรวจสุขภาพ (ผู้ป่วยนอก 2/OPD 2)\n"
+            "- วันจันทร์และวันอังคาร 08.00-16.00 น. : แพทย์หญิงชนกนันท์ เนติศุภลักษณ์\n"
+            "- วันพฤหัสบดี 08.00-16.00 น. : แพทย์หญิงอชิรญา ชนะพาล\n"
+            "- วันศุกร์ 08.00-12.00 น. : แพทย์หญิงอชิรญา ชนะพาล"
+        )
+        attachments = _dedupe_attachments([
+            Attachment(
+                type="image",
+                label="รูปตารางแพทย์ ตรวจสุขภาพ",
+                url="/assets/schedule/เวชศาสตร์.png",
+                filename="เวชศาสตร์.png",
+            )
+        ])
+        _remember(session, category="ตารางแพทย์และเวลาทำการ", buttons=buttons)
+        response = ChatResponse(
+            route="answer",
+            answer=answer,
+            confidence=1.0,
+            reason="schedule_checkup_pre_rewrite",
+            selected_category="ตารางแพทย์และเวลาทำการ",
+            action_buttons=buttons,
+            attachments=attachments,
+            candidates=[],
+        )
+        return _finalize_chat_response(req, session, raw_query, response)
+
     query = _strip_runtime_wrappers(_rewrite_runtime_query(original_normalized_query))
 
     broad_vaccine_terms = {"วัคซีน", "วักซีน", "วัปซีน", "วคซีน"}
@@ -2450,7 +3455,7 @@ def _chat_impl(req: ChatRequest) -> ChatResponse:
             _remember(session, category="การขอเอกสารทางการแพทย์", topic=doc_topic, buttons=buttons)
             response = ChatResponse(
                 route="answer",
-                answer=format_direct_answer(doc_topic) + "\n\n" + build_followup_hint_text("การขอเอกสารทางการแพทย์", doc_topic.question),
+                answer=format_direct_answer(doc_topic),
                 confidence=max(round(doc_topic.final_score, 4), 0.9),
                 reason="job_medical_certificate_match",
                 source_id=doc_topic.id,
@@ -2581,6 +3586,178 @@ def _chat_impl(req: ChatRequest) -> ChatResponse:
     if EMERGENCY_RE.search(query):
         response = ChatResponse(route="fallback", answer=emergency_text(), confidence=0.99, reason="emergency_redirect", action_buttons=["ฉุกเฉิน 1669", "ติดต่อแผนกฉุกเฉิน"])
         return _finalize_chat_response(req, session, query, response)
+
+    shortcut_query = wrapper_stripped_query or raw_query
+
+    if _normalize(query) == "ติดต่อโรงพยาบาล":
+        response = ChatResponse(
+            route="answer",
+            answer=_official_contact_answer(),
+            confidence=1.0,
+            reason="official_contact",
+            action_buttons=list(FALLBACK_ACTION_BUTTONS),
+        )
+        return _finalize_chat_response(req, session, query, response)
+
+    if _normalize(shortcut_query) == _normalize("เวลาตรวจสุขภาพ"):
+        logger.info("Using exact health-check hours shortcut for query='%s'", shortcut_query)
+        topic = _find_candidate_by_id("qa-0050")
+        buttons = _topic_follow_up_buttons(topic) if topic is not None else ["เวลาตรวจสุขภาพ", "โปรแกรมตรวจสุขภาพ", "ใบรับรองแพทย์", "กลับไปหมวดตรวจสุขภาพและใบรับรองแพทย์"]
+        answer = HEALTH_CHECK_HOURS_ANSWER
+        if topic is not None:
+            _remember(session, category="ตรวจสุขภาพรายบุคคล", topic=topic, buttons=buttons)
+        else:
+            _remember(session, category="ตรวจสุขภาพรายบุคคล", buttons=buttons)
+        response = ChatResponse(
+            route="answer",
+            answer=answer,
+            confidence=1.0,
+            reason="health_check_hours_shortcut",
+            source_id=topic.id if topic is not None else None,
+            selected_category="ตรวจสุขภาพรายบุคคล",
+            action_buttons=buttons,
+            attachments=[],
+            candidates=[_to_candidate_response(topic)] if topic is not None else [],
+        )
+        return _finalize_chat_response(req, session, shortcut_query, response)
+
+    health_shortcut = _health_check_shortcut_candidate(shortcut_query)
+    if health_shortcut is not None:
+        logger.info("Using generic health-check shortcut for query='%s'", shortcut_query)
+        topic, selected_category = health_shortcut
+        buttons = _topic_follow_up_buttons(topic)
+        shortcut_answer = format_direct_answer(topic)
+        if _normalize(shortcut_query) == _normalize("โปรแกรมตรวจสุขภาพ"):
+            shortcut_answer = HEALTH_CHECK_PROGRAM_ANSWER
+        elif _normalize(shortcut_query) == _normalize("ใบรับรองแพทย์"):
+            shortcut_answer = HEALTH_CHECK_CERTIFICATE_ANSWER
+        _remember(session, category=selected_category, topic=topic, buttons=buttons)
+        response = ChatResponse(
+            route="answer",
+            answer=shortcut_answer,
+            confidence=1.0,
+            reason="health_check_shortcut",
+            source_id=topic.id,
+            selected_category=selected_category,
+            action_buttons=buttons,
+            attachments=_attachments_for_answer_topic(topic),
+            candidates=[_to_candidate_response(topic)],
+        )
+        return _finalize_chat_response(req, session, shortcut_query, response)
+
+    query_normalized = _normalize(query)
+    query_compact = _compact_normalize(query)
+
+    appointment_buttons = ["การจัดการนัดหมาย", "ตารางแพทย์และเวลาทำการ", "กลับหน้าหลัก"]
+    reschedule_markers = ("ขอเลื่อนนัดพบแพทย์", "เลื่อนนัดพบแพทย์", "ขอเลื่อนนัด", "เลื่อนนัด", "ขอเปลี่ยนนัด", "เปลี่ยนนัด")
+    if any(_compact_normalize(marker) in query_compact for marker in reschedule_markers):
+        topic = _find_candidate_by_id("qa-0002") or _find_candidate_by_id("qa-0039")
+        answer = format_direct_answer(topic) if topic is not None else (
+            "แผนกผู้ป่วยนอก 1 โทร 054 466 666 ต่อ 7304\n"
+            "แผนกผู้ป่วยนอก 2 โทร 054 466 666 ต่อ 7173\n"
+            "แผนกผู้ป่วยนอก 3 (หู คอ จมูก ตา) โทร 054 466 666 ต่อ 7210\n"
+            "แผนกผู้ป่วยนอก 3 (สูติ-นรีเวช) โทร 054 466 666 ต่อ 7152\n"
+            "แผนกผู้ป่วยนอก 4 (ความดัน/ระบบประสาทและสมอง/ทางเดินอาหาร) โทร 054 466 666 ต่อ 7182\n"
+            "แผนกผู้ป่วยนอก 4 (หัวใจ) โทร 054 466 666 ต่อ 7171\n"
+            "แผนกกระดูกและข้อ โทร 054 466 666 ต่อ 7406/7409\n"
+            "ห้อง X-Ray/CT-Scan โทร 054 466 666 ต่อ 7291\n"
+            "แผนกกายภาพบำบัด โทร 054 46 666 ต่อ 7190\n"
+            "แผนกแพทย์แผนไทย&จีน โทร 054 466 666 ต่อ 7113, 7114"
+        )
+        if topic is not None:
+            _remember(session, category="การจัดการนัดหมาย", topic=topic, buttons=appointment_buttons)
+        else:
+            _remember(session, category="การจัดการนัดหมาย", buttons=appointment_buttons)
+        response = ChatResponse(
+            route="answer",
+            answer=answer,
+            confidence=1.0,
+            reason="appointment_reschedule_shortcut",
+            source_id=topic.id if topic is not None else None,
+            selected_category="การจัดการนัดหมาย",
+            action_buttons=appointment_buttons,
+            attachments=[],
+            candidates=[_to_candidate_response(topic)] if topic is not None else [],
+        )
+        return _finalize_chat_response(req, session, query, response)
+
+    if query_normalized == _normalize("เวลาทำการแผนกผู้ป่วยนอก"):
+        topic = _find_candidate_by_id("qa-0011") or _find_candidate_by_id("qa-0048")
+        buttons = ["ตารางแพทย์ออกตรวจ", "เวลาทำการแผนกผู้ป่วยนอก", "กลับไปหมวดนัดหมายและตารางแพทย์"]
+        answer = format_direct_answer(topic) if topic is not None else (
+            "แผนกผู้ป่วยนอก เปิดในเวลา 08.00-16.00 น. ทุกวันทำการ นอกเวลาทำการ 16.00-20.00 น. "
+            "หยุดทุกวันเสาร์-อาทิตย์ และวันหยุดนักขัตฤกษ์ค่ะ\n*แผนกฉุกเฉินเปิดบริการ 24 ชั่วโมง*"
+        )
+        if topic is not None:
+            _remember(session, category="ตารางแพทย์และเวลาทำการ", topic=topic, buttons=buttons)
+        else:
+            _remember(session, category="ตารางแพทย์และเวลาทำการ", buttons=buttons)
+        response = ChatResponse(
+            route="answer",
+            answer=answer,
+            confidence=1.0,
+            reason="opd_hours_shortcut",
+            source_id=topic.id if topic is not None else None,
+            selected_category="ตารางแพทย์และเวลาทำการ",
+            action_buttons=buttons,
+            attachments=[],
+            candidates=[_to_candidate_response(topic)] if topic is not None else [],
+        )
+        return _finalize_chat_response(req, session, query, response)
+
+    if query_normalized == _normalize("ตรวจสุขภาพ"):
+        buttons = ["ค้นหาตามเฉพาะทาง", "ดูตารางสาขาอื่น", "เวลาทำการแผนกผู้ป่วยนอก", "กลับไปหมวดนัดหมายและตารางแพทย์"]
+        answer = (
+            "ตรวจสุขภาพ (ผู้ป่วยนอก 2/OPD 2)\n"
+            "- วันจันทร์และวันอังคาร 08.00-16.00 น. : แพทย์หญิงชนกนันท์ เนติศุภลักษณ์\n"
+            "- วันพฤหัสบดี 08.00-16.00 น. : แพทย์หญิงอชิรญา ชนะพาล\n"
+            "- วันศุกร์ 08.00-12.00 น. : แพทย์หญิงอชิรญา ชนะพาล"
+        )
+        attachments = _dedupe_attachments([
+            Attachment(
+                type="image",
+                label="รูปตารางแพทย์ ตรวจสุขภาพ",
+                url="/assets/schedule/เวชศาสตร์.png",
+                filename="เวชศาสตร์.png",
+            )
+        ])
+        _remember(session, category="ตารางแพทย์และเวลาทำการ", buttons=buttons)
+        response = ChatResponse(
+            route="answer",
+            answer=answer,
+            confidence=1.0,
+            reason="schedule_checkup_exact_shortcut",
+            selected_category="ตารางแพทย์และเวลาทำการ",
+            action_buttons=buttons,
+            attachments=attachments,
+            candidates=[],
+        )
+        return _finalize_chat_response(req, session, query, response)
+
+    # BUG 1 FIX: Early detection for "ตรวจสุขภาพ" queries to prevent routing to schedule
+    # This must come before schedule matching logic
+    health_check_keywords = {"โปรแกรมตรวจสุขภาพ", "เวลาตรวจสุขภาพ", "ใบรับรองแพทย์"}
+    if any(keyword in query_normalized for keyword in health_check_keywords):
+        # Check if this is NOT in a schedule context
+        schedule_context_active = session.last_category in {"ตารางแพทย์และเวลาทำการ", "นัดหมายและตารางแพทย์"}
+        # Only route to health-check if NOT in schedule context AND query is health-check related
+        if not schedule_context_active and not _is_schedule_query(query):
+            logger.info("Health-check query detected, routing to health-check category: '%s'", query[:50])
+            # Route to health-check category overview
+            category_candidates = _category_browse_candidates("ตรวจสุขภาพและใบรับรองแพทย์")
+            buttons = ["เวลาตรวจสุขภาพ", "โปรแกรมตรวจสุขภาพ", "ใบรับรองแพทย์", "กลับหน้าหลัก"]
+            _remember(session, category="ตรวจสุขภาพรายบุคคล", buttons=buttons)
+            response = ChatResponse(
+                route="clarify",
+                answer="หมวดตรวจสุขภาพและใบรับรองแพทย์ มีหัวข้อที่เลือกได้ดังนี้\n" + "\n".join(f"- {b}" for b in buttons if b != "กลับหน้าหลัก"),
+                confidence=0.98,
+                reason="health_check_category_routing",
+                selected_category="ตรวจสุขภาพรายบุคคล",
+                clarification_options=buttons,
+                action_buttons=buttons,
+                candidates=[_to_candidate_response(c) for c in category_candidates[:5]],
+            )
+            return _finalize_chat_response(req, session, query, response)
 
     category_hint, matched_alias, alias_score = _detect_preferred_category(req.preferred_category or query)
     # If the session was just reset very recently, and the current query is a small follow-up
@@ -2718,7 +3895,61 @@ def _chat_impl(req: ChatRequest) -> ChatResponse:
         )
         return _finalize_chat_response(req, session, query, response)
 
-    if _is_schedule_query(query):
+    schedule_context_active = session.last_category in {"ตารางแพทย์และเวลาทำการ", "นัดหมายและตารางแพทย์"}
+    doctor_schedule_match = _match_schedule_master_doctor(query) or _match_schedule_doctor(query)
+    if doctor_schedule_match:
+        ambiguous_doctors = doctor_schedule_match.get("ambiguous_doctors")
+        if ambiguous_doctors:
+            response = ChatResponse(
+                route="clarify",
+                answer="พบชื่อแพทย์ใกล้เคียงมากกว่าหนึ่งท่าน กรุณาเลือกชื่อแพทย์ที่ต้องการ",
+                confidence=0.75,
+                reason="schedule_doctor_ambiguous",
+                selected_category="ตารางแพทย์และเวลาทำการ",
+                clarification_options=ambiguous_doctors,
+                action_buttons=ambiguous_doctors,
+                candidates=[],
+            )
+            return _finalize_chat_response(req, session, query, response)
+
+        if doctor_schedule_match.get("topic") is not None:
+            schedule_topic = doctor_schedule_match["topic"]
+            answer_text = _format_schedule_doctor_answer(doctor_schedule_match)
+            attachments = _build_attachments_for_topic(schedule_topic)
+            buttons = _topic_follow_up_buttons(schedule_topic)
+            source_id = schedule_topic.id
+            candidates = [_to_candidate_response(schedule_topic)]
+            _remember(session, category="ตารางแพทย์และเวลาทำการ", topic=schedule_topic, buttons=buttons)
+        else:
+            source_topic = None
+            source_id = None
+            doctor_rows = list(doctor_schedule_match.get("rows") or [])
+            if doctor_rows:
+                source_id = doctor_rows[0]["entry"].source_id
+                source_topic = _find_candidate_by_id(source_id)
+            answer_text = _format_schedule_master_doctor_answer(doctor_schedule_match)
+            attachments = _schedule_master_attachments_for_doctor(doctor_schedule_match)
+            buttons = _topic_follow_up_buttons(source_topic) if source_topic is not None else ["ค้นหาตามเฉพาะทาง", "ดูตารางสาขาอื่น", "เวลาทำการแผนกผู้ป่วยนอก", "กลับไปหมวดนัดหมายและตารางแพทย์"]
+            candidates = [_to_candidate_response(source_topic)] if source_topic is not None else []
+            if source_topic is not None:
+                _remember(session, category="ตารางแพทย์และเวลาทำการ", topic=source_topic, buttons=buttons)
+            else:
+                _remember(session, category="ตารางแพทย์และเวลาทำการ", buttons=buttons)
+        response = ChatResponse(
+            route="answer",
+            answer=answer_text,
+            confidence=0.98,
+            reason="schedule_doctor_match",
+            source_id=source_id,
+            selected_category="ตารางแพทย์และเวลาทำการ",
+            action_buttons=buttons,
+            attachments=attachments,
+            candidates=candidates,
+        )
+        return _finalize_chat_response(req, session, query, response)
+
+    schedule_master_entry = _find_schedule_master_entry(query)
+    if _is_schedule_query(query) or schedule_context_active or schedule_master_entry is not None:
         schedule_match = _match_schedule_record(query)
         broad_schedule = bool(re.fullmatch(r"(ตารางแพทย์|ตารางหมอ|หมอออกตรวจ|หมอเข้า|หมอวันนี้|แพทย์ออกตรวจ)", query.strip()))
         schedule_q = _normalize(query)
@@ -2736,6 +3967,28 @@ def _chat_impl(req: ChatRequest) -> ChatResponse:
             and ("หมอ" in query or "แพทย์" in query)
             and generic_schedule_terms
         )
+        if schedule_master_entry is not None and not broad_schedule:
+            day_filter = _detect_thai_day(query)
+            source_topic = _find_candidate_by_id(schedule_master_entry.source_id)
+            answer_text = _format_schedule_master_answer(schedule_master_entry, day_filter=day_filter)
+            attachments = _build_schedule_master_attachments(schedule_master_entry)
+            buttons = _topic_follow_up_buttons(source_topic) if source_topic is not None else ["ค้นหาตามเฉพาะทาง", "ดูตารางสาขาอื่น", "เวลาทำการแผนกผู้ป่วยนอก", "กลับไปหมวดนัดหมายและตารางแพทย์"]
+            if source_topic is not None:
+                _remember(session, category="ตารางแพทย์และเวลาทำการ", topic=source_topic, buttons=buttons)
+            else:
+                _remember(session, category="ตารางแพทย์และเวลาทำการ", buttons=buttons)
+            response = ChatResponse(
+                route="answer",
+                answer=answer_text,
+                confidence=0.98,
+                reason="schedule_master_match",
+                source_id=schedule_master_entry.source_id,
+                selected_category="ตารางแพทย์และเวลาทำการ",
+                action_buttons=buttons,
+                attachments=attachments,
+                candidates=[_to_candidate_response(source_topic)] if source_topic is not None else [],
+            )
+            return _finalize_chat_response(req, session, query, response)
         if schedule_match is not None and not broad_schedule:
             answer_text = format_direct_answer(schedule_match)
             # Day-aware filtering
@@ -2776,7 +4029,7 @@ def _chat_impl(req: ChatRequest) -> ChatResponse:
                 session.last_category = "ตารางแพทย์และเวลาทำการ"
                 response = ChatResponse(
                     route="answer",
-                    answer=answer + "\n\n" + build_followup_hint_text("ตารางแพทย์และเวลาทำการ", dental_topic.question),
+                    answer=answer,
                     confidence=max(round(dental_topic.final_score, 4), 0.88),
                     reason="schedule_alias_fallback_to_dental",
                     source_id=dental_topic.id,
@@ -2848,7 +4101,7 @@ def _chat_impl(req: ChatRequest) -> ChatResponse:
             _remember(session, category=follow_category, topic=follow_topic, buttons=buttons)
             response = ChatResponse(
                 route="answer",
-                answer=answer + "\n\n" + build_followup_hint_text(follow_category, follow_topic.question),
+                answer=answer,
                 confidence=0.9,
                 reason="session_follow_up_answer",
                 source_id=follow_topic.id,
@@ -2904,7 +4157,13 @@ def _chat_impl(req: ChatRequest) -> ChatResponse:
         return _finalize_chat_response(req, session, query, response)
 
     if best_catalog is not None and _record_type(best_catalog) == "child_topic":
-        if typo_source and category_hint and _is_broad_category_query(query, category_hint):
+        if (
+            typo_source
+            and category_hint
+            and _is_broad_category_query(query, category_hint)
+            and not _looks_like_exact(query, best_catalog.question)
+            and not _looks_like_exact(query, best_catalog.subcategory or "")
+        ):
             buttons = _category_action_buttons(category_hint, category_browse)
             _remember(session, category=category_hint, buttons=buttons)
             response = ChatResponse(
@@ -2955,12 +4214,15 @@ def _chat_impl(req: ChatRequest) -> ChatResponse:
                 leaf_query = "วัคซีนบาดทะยัก/พิษสุนัขบ้า"
             
         if child_rows:
-            for r in child_rows:
-                score = _catalog_match_score(leaf_query, r, canonical_child_category)
-                if score >= 0.22:
-                    scoped_leaf_candidates.append(_record_to_candidate(r, score))
-            scoped_leaf_candidates.sort(key=lambda c: c.final_score, reverse=True)
-            scoped_leaf_candidates = scoped_leaf_candidates[:5]
+            if exact_child_query and len(child_rows) == 1:
+                scoped_leaf_candidates = [_record_to_candidate(child_rows[0], 1.0)]
+            else:
+                for r in child_rows:
+                    score = _catalog_match_score(leaf_query, r, canonical_child_category)
+                    if score >= 0.22:
+                        scoped_leaf_candidates.append(_record_to_candidate(r, score))
+                scoped_leaf_candidates.sort(key=lambda c: c.final_score, reverse=True)
+                scoped_leaf_candidates = scoped_leaf_candidates[:5]
         else:
             scoped_leaf_candidates = [
                 candidate
@@ -2972,18 +4234,18 @@ def _chat_impl(req: ChatRequest) -> ChatResponse:
             top_leaf = scoped_leaf_candidates[0]
             if _record_type(top_leaf) == "schedule_specific":
                 answer = _format_schedule_answer(top_leaf, day_filter=_detect_thai_day(query))
-                attachments = _build_attachments_for_topic(top_leaf)
+                attachments = _attachments_for_answer_topic(top_leaf)
             elif ANSWER_MODE == "kb_exact":
                 answer = format_direct_answer(top_leaf)
-                attachments = []
+                attachments = _attachments_for_answer_topic(top_leaf)
             else:
                 answer = _generate_answer(query, top_leaf, scoped_leaf_candidates[:4], use_llm=req.use_llm)
-                attachments = []
+                attachments = _attachments_for_answer_topic(top_leaf)
             buttons = _topic_follow_up_buttons(top_leaf)
             _remember(session, category=canonical_child_category, topic=top_leaf, buttons=buttons)
             response = ChatResponse(
                 route="answer",
-                answer=answer if _record_type(top_leaf) == "schedule_specific" else answer + "\n\n" + build_followup_hint_text(top_leaf.category, top_leaf.question),
+                answer=answer,
                 confidence=max(round(top_leaf.final_score, 4), 0.88),
                 reason="child_topic_leaf_resolution",
                 source_id=top_leaf.id,
@@ -3083,7 +4345,9 @@ def _chat_impl(req: ChatRequest) -> ChatResponse:
     if _has_specific_match(query, best_catalog):
         answer_category = _resolved_response_category(best_catalog, query, category_hint) or best_catalog.category
         # KB-FIRST: If we have a direct match and mode is kb_exact, use direct answer
-        if ANSWER_MODE == "kb_exact" and best_catalog:
+        if _record_type(best_catalog) == "schedule_specific":
+            answer = _format_schedule_answer(best_catalog, day_filter=_detect_thai_day(query))
+        elif ANSWER_MODE == "kb_exact" and best_catalog:
             answer = format_direct_answer(best_catalog)
             logger.info("🎯 Direct catalog match (kb_exact) → Returning direct answer for ID: %s", best_catalog.id)
         else:
@@ -3093,12 +4357,13 @@ def _chat_impl(req: ChatRequest) -> ChatResponse:
         _remember(session, category=answer_category, topic=best_catalog, buttons=buttons)
         response = ChatResponse(
             route="answer",
-            answer=answer + "\n\n" + build_followup_hint_text(answer_category, best_catalog.question),
+            answer=answer,
             confidence=round(best_catalog.final_score, 4),
             reason="direct_catalog_match",
             source_id=best_catalog.id,
             selected_category=answer_category,
             action_buttons=buttons,
+            attachments=_attachments_for_answer_topic(best_catalog),
             candidates=[_to_candidate_response(best_catalog)],
         )
         append_audit_event(AUDIT_LOG_PATH, {"event_type": "chat", "question": query, "route": response.route, "reason": response.reason, "source_id": response.source_id})
@@ -3108,9 +4373,13 @@ def _chat_impl(req: ChatRequest) -> ChatResponse:
 
     retrieved: list[RetrievalCandidate] = []
     if state.retriever is not None:
-        retrieved = state.retriever.search(query=query, top_k=req.top_k, category=category_hint)
-        if not retrieved and category_hint:
-            retrieved = state.retriever.search(query=query, top_k=req.top_k, category=None)
+        try:
+            retrieved = state.retriever.search(query=query, top_k=req.top_k, category=category_hint)
+            if not retrieved and category_hint:
+                retrieved = state.retriever.search(query=query, top_k=req.top_k, category=None)
+        except Exception as exc:
+            logger.warning("Retriever search failed for query '%s': %s", query[:80], exc)
+            retrieved = []
 
     merged = _merge_candidates(catalog_in_category, catalog_global, retrieved, limit=req.top_k)
     reranked = state.reranker.rerank(query, merged)
@@ -3167,13 +4436,14 @@ def _chat_impl(req: ChatRequest) -> ChatResponse:
     _remember(session, category=top.category, topic=top, buttons=buttons)
     response = ChatResponse(
         route="answer",
-        answer=answer + "\n\n" + build_followup_hint_text(top.category, top.question),
+        answer=answer,
         confidence=decision.confidence,
         reason=decision.reason,
         warnings=decision.warnings,
         source_id=top.id,
         selected_category=top.category,
         action_buttons=buttons,
+        attachments=_attachments_for_answer_topic(top),
         candidates=[_to_candidate_response(c) for c in reranked[:5]],
     )
     latency = round(time.time() - t_start, 3)
