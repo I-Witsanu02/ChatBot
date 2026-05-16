@@ -182,19 +182,6 @@ npm run start
 - วางนโยบาย retention ของ log ให้สอดคล้องกับ PDPA
 - ถ้าจะเปิดให้ใช้ภายในองค์กร ให้จำกัดการเข้าถึงเฉพาะเครือข่ายที่จำเป็น
 
-## ถ้าส่งมอบเฉพาะ Frontend
-สามารถส่งได้เฉพาะ:
-
-```text
-nextjs_frontend/app/page.js
-nextjs_frontend/app/layout.js
-nextjs_frontend/app/globals.css
-nextjs_frontend/app/error.js
-nextjs_frontend/package.json
-nextjs_frontend/package-lock.json
-nextjs_frontend/next.config.js
-nextjs_frontend/.env.example
-```
 
 แต่ต้องแจ้งให้ชัดว่า:
 - Frontend อย่างเดียวเปิดหน้าเว็บได้

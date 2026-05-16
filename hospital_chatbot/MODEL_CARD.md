@@ -1,198 +1,188 @@
-# Model Card: UPH Hospital Chatbot
+# Model Card: UPH Hospital Chatbot (Revised)
 
-## Model Details
+## 1. Model/System Details
 
-### Model Identifier
-- **Project Name**: UPH Hospital Chatbot (UP FahMui ChatBot)
-- **Model Type**: Retrieval-Augmented Generation (RAG) System
-- **Backend Framework**: FastAPI + Ollama
-- **Frontend Framework**: Next.js
-- **Language**: Thai (ไทย)
-- **Knowledge Cutoff**: Based on hospital knowledge base (data/knowledge.jsonl)
+### Project Name
+UPH Hospital Chatbot / น้องฟ้ามุ่ย AI
 
-### Model Architecture
-This is a **knowledge-base-first RAG system**, not a general-purpose LLM:
+### System Type
+Verified KB-first / RAG-first hospital service chatbot
 
-1. **Retrieval Layer**
-   - Vector search over hospital knowledge base
-   - Knowledge source: `data/knowledge.jsonl` / `data/knowledge.csv`
-   - Reranking for relevance
+### Main Components
+- Frontend: Next.js
+- Backend: FastAPI
+- LLM Runtime: Ollama
+- Knowledge Base: `data/knowledge.jsonl`, `data/knowledge.csv`
+- Main Excel Source: `data/AIคำถามคำตอบงานสื่อสาร01.04.69.xlsx`
+- Attachments: schedule and health-check images under `data/`
 
-2. **Reasoning Layer**
-   - LLM-based intent detection and response formatting
-   - Policy checking for safe responses
-   - NO knowledge generation—only formatting and rewriting
-
-3. **Application Layer**
-   - Hospital scheduling and menu routing
-   - Hospital contact information
-   - Service information and certificates
+### Important Design Choice
+ระบบนี้ไม่ใช่ LLM-only และไม่ควรให้ LLM เป็นแหล่งความจริงของข้อมูลโรงพยาบาล  
+ข้อมูลจริง เช่น เบอร์โทร ตารางแพทย์ เวลาให้บริการ ราคา และรูปภาพ ต้องมาจาก KB หรือ structured source ที่ตรวจสอบแล้ว
 
 ---
 
-## Intended Use
+## 2. Intended Use
 
-### Primary Use Cases
-✅ **Recommended**
-- Information about hospital services and contact details
-- Doctor schedule queries (ตารางแพทย์)
-- Vaccination appointment and information (วัคซีน)
-- Annual health check programs (ตรวจสุขภาพประจำปี)
-- Health certificates and documentation
-- Hospital contact numbers and extensions
-- Service availability and operating hours
+เหมาะสำหรับ:
+- ข้อมูลบริการโรงพยาบาล
+- ตารางแพทย์และเวลาทำการ
+- วัคซีนและบริการผู้ป่วยนอก
+- ตรวจสุขภาพและใบรับรองแพทย์
+- ช่องทางติดต่อและเลขต่อ
+- คำถามที่มีข้อมูลอยู่ในฐานความรู้
 
-### Limitations & Restrictions
-❌ **NOT Recommended**
-- **Medical Diagnosis**: Do NOT use for diagnosing diseases
-- **Treatment Advice**: Do NOT provide treatment recommendations
-- **Patient Data**: Do NOT use with real patient information
-- **Medical Research**: Do NOT use as a medical research source
-- **Emergency Care**: Do NOT use for emergencies—always call hospital directly
-- **Prescription Information**: Not suitable for detailed drug interactions
-- **Liability**: Chatbot responses do not constitute medical advice
+ไม่เหมาะสำหรับ:
+- วินิจฉัยโรค
+- ให้คำแนะนำการรักษาเฉพาะบุคคล
+- วิเคราะห์อาการแทนแพทย์
+- ใช้ในภาวะฉุกเฉิน
+- รับหรือประมวลผลข้อมูลผู้ป่วยจริงโดยไม่ผ่านนโยบาย PDPA
+- ตอบข้อมูลที่ไม่มีใน KB โดยการคาดเดา
 
 ---
 
-## Knowledge Base
+## 3. Knowledge Base
 
-### Primary Data Source
-- **Excel File**: `data/AIคำถามคำตอบงานสื่อสาร01.04.69.xlsx`
-- **Format**: Q&A pairs in Thai, organized by department/service
-- **Last Updated**: As per version in filename (01.04.69 = April 1, 2569 Thai calendar)
+### Primary Source
+`data/AIคำถามคำตอบงานสื่อสาร01.04.69.xlsx`
 
-### Runtime Knowledge Files
-- `data/knowledge.jsonl`: Structured Q&A data with metadata
-- `data/knowledge.csv`: CSV export of knowledge base
-- `data/ตารางออกตรวจแพทย์/`: Doctor schedule images
-- `data/ตรวจสุขภาพประจำปี/`: Health check program images
+### Runtime Files
+- `data/knowledge.jsonl`
+- `data/knowledge.csv`
 
-### Update Process
-1. Update Excel source file
-2. Export to `knowledge.jsonl` / `knowledge.csv`
-3. Rebuild vector index
-4. Restart backend service
+### Image Assets
+- `data/ตารางออกตรวจแพทย์/`
+- `data/ตรวจสุขภาพประจำปี/`
 
----
-
-## Model Behavior & Safety
-
-### Response Policy
-- Responses are **retrieved from knowledge base**, not generated
-- If information is not in knowledge base → return "cannot answer"
-- **No hallucination**: Never invent hospital facts
-- **No diagnosis**: Decline medical diagnosis requests
-- **No treatment advice**: Redirect to real doctor
-
-### Typo & Intent Handling
-- Thai text preprocessing (diacritic normalization)
-- Short query understanding (e.g., "นัดหมาย" → appointment scheduling)
-- Intent categorization for menu routing
-
-### Safe Fallback
-```
-User: "ฉันเจ็บท้อง"  (I have stomach pain)
-Bot: "ขออภัย ฉันไม่สามารถวินิจฉัยโรคได้ โปรดติดต่อแพทย์จริง"
-     "Sorry, I cannot diagnose disease. Please consult a real doctor."
-```
+### Update Workflow
+1. แก้ข้อมูลใน Excel ต้นฉบับ
+2. Rebuild/export เป็น `knowledge.jsonl` และ `knowledge.csv`
+3. ตรวจว่าไม่มีคอลัมน์หมายเหตุหลุดในคำตอบผู้ใช้
+4. Restart backend
+5. รัน regression/UAT
 
 ---
 
-## Technical Specifications
+## 4. Model Behavior
 
-### Input/Output
-- **Input**: Thai text queries (user messages)
-- **Output**: Thai text responses with optional attachments
-- **Max Response Time**: ~3 seconds (including retrieval + ranking + generation)
-- **Confidence Scoring**: Available for retrieval results
+### KB-first Behavior
+ระบบพยายามตอบจาก:
+1. menu/routing logic
+2. structured schedule master
+3. health-check shortcut
+4. knowledge retrieval
+5. safe fallback
 
-### Deployment Requirements
-- **Python**: 3.9+
-- **Node.js**: 18+ (frontend)
-- **Memory**: 4GB+ (recommended 8GB)
-- **GPU**: Optional (faster inference with CUDA)
-- **Database**: Chroma vector DB (included)
+### LLM Role
+LLM ใช้เป็นตัวช่วยสำหรับ:
+- ทำความเข้าใจคำถาม
+- ช่วยเรียบเรียงคำตอบ
+- รองรับคำถามภาษาธรรมชาติ
+- ช่วยกรณีที่ retrieval มี context ที่ชัดเจน
 
-### Performance Characteristics
-- **Latency**: ~1-3 seconds per query (includes network)
-- **Throughput**: ~10-20 concurrent users
-- **Availability**: Depends on backend uptime and vector DB
-- **Accuracy**: Depends on knowledge base quality and relevance of documents
-
----
-
-## Evaluation & Testing
-
-### Test Suite
-- `test_focused_runtime_regression.py`: Focused regression test suite
-- Coverage: ~150 critical queries across all hospital services
-- Test categories:
-  - Scheduling (appointment, reschedule)
-  - Doctor information
-  - Service details
-  - Certificate programs
-  - Safety/fallback behavior
-
-### Evaluation Metrics
-- **Retrieval Accuracy**: % of queries returning correct knowledge items
-- **Intent Recognition**: % of queries correctly categorized
-- **Response Relevance**: Manual QA score (1-5)
-- **Safe Fallback**: % of out-of-scope queries declined properly
-
-### Known Issues & Limitations
-1. **Long Thai sentences**: May struggle with very long or complex Thai text
-2. **Ambiguous queries**: Short queries (< 5 words) require contextual clues
-3. **New services**: Not available until knowledge base is updated
-4. **Multi-turn context**: Limited conversation history support
-5. **Real-time info**: Doctor availability is point-in-time snapshot
+LLM ไม่ควร:
+- แต่งเบอร์โทร
+- แต่งราคา
+- แต่งตารางแพทย์
+- ตอบคำแนะนำทางการแพทย์
+- ใช้ข้อมูลที่ไม่มีแหล่งอ้างอิงใน KB
 
 ---
 
-## Data & Privacy
+## 5. Safety Policy
 
-### Data Handling
-- Knowledge base contains **NO patient data**
-- Chat logs: Not collected by default
-- Analytics: Optional (separate database if enabled)
-- API Keys: Use `.env` file (never commit)
+ระบบควรปฏิเสธหรือ fallback เมื่อ:
+- คำถามไม่มีข้อมูลในฐานความรู้
+- คำถามต้องการวินิจฉัยโรค
+- คำถามต้องการคำแนะนำการรักษาเฉพาะบุคคล
+- คำถามเกี่ยวกับราคาหรือบริการที่ไม่มีข้อมูลยืนยัน
+- retrieval confidence ต่ำ
 
-### Security Recommendations
-1. Use HTTPS in production
-2. Implement rate limiting on `/chat` endpoint
-3. Monitor for abuse or unusual query patterns
-4. Regularly backup knowledge base
-5. Restrict API access to hospital network
+ข้อความ fallback ควรแนะนำให้ติดต่อโรงพยาบาลโดยใช้เบอร์กลาง:
+`0 5446 6666 ต่อ 7000`
 
 ---
 
-## Version History
+## 6. Privacy and Data Handling
 
-| Version | Date | Notes |
-|---------|------|-------|
-| 1.0 | 2569-04-01 | Initial release with 150+ Q&A pairs |
-| 1.1 | Current | Enhanced Thai tokenization & intent routing |
-
----
-
-## Contact & Support
-
-For questions about:
-- **System Issues**: Contact IT department
-- **Knowledge Base Updates**: Contact Hospital Communications Team
-- **Chatbot Logic Issues**: Refer to README.md and code comments in `backend/`
+- ฐานความรู้ที่ส่งมอบไม่ควรมีข้อมูลผู้ป่วยจริง
+- ไม่ควร commit `.env`, logs, analytics DB หรือ audit logs
+- หากเปิด logging ใน production ต้องมีนโยบาย retention/anonymization
+- การทดสอบ UAT ควรใช้คำถามสมมติ ไม่ใช้ข้อมูลผู้ป่วยจริง
 
 ---
 
-## License & Attribution
+## 7. Evaluation Plan
 
-This chatbot is proprietary to Phayao University Hospital (UPH).
-All hospital data, schedules, and service information are confidential.
+ควรวัดผลหลายระดับ:
+
+| Metric | Purpose |
+|---|---|
+| Focused Regression Pass Rate | ตรวจเคสสำคัญที่ต้องไม่พัง |
+| Intent Accuracy | วัดการจับเจตนาคำถาม |
+| Retrieval Hit@1 / Hit@3 | วัดว่าดึง KB ถูกไหม |
+| Faithfulness | ตรวจว่าคำตอบยึดตาม context |
+| Answer Relevancy | ตรวจว่าตอบตรงคำถาม |
+| Hallucination Rate | วัดการแต่งข้อมูล |
+| Fallback Accuracy | วัดว่าคำถามนอก KB fallback ถูกไหม |
+| Attachment Accuracy | รูปที่แนบตรงกับคำตอบไหม |
+| Schedule Completeness | ตารางแพทย์ครบไหม |
+| Doctor Alias Match Rate | ค้นชื่อแพทย์/ชื่อย่อได้ไหม |
+| Forbidden Leakage Rate | มี `D:\`, `หมายเหตุ:`, `อัปเดตล่าสุด:` หลุดไหม |
+| Latency p50/p95 | วัดความเร็วตอบ |
+| Human UAT Score | ความพึงพอใจและความถูกต้องจากผู้ทดสอบ |
 
 ---
 
-## Compliance
+## 8. Known Limitations
 
-- ✅ GDPR-ready: No personal data stored
-- ✅ Thai language support: Full UTF-8 compliance
-- ✅ Accessibility: Keyboard navigation support
-- ⚠️ Medical Compliance: NOT a medical device—informational only
+- ความถูกต้องขึ้นกับความถูกต้องของ KB
+- ตารางแพทย์และราคาบริการเปลี่ยนได้ ต้องอัปเดตฐานความรู้
+- ถ้าไม่มี KB โมเดลไม่ควรถือว่าตอบข้อมูลโรงพยาบาลได้ถูกต้อง
+- การรองรับชื่อเล่น/คำสะกดผิดต้องพัฒนา alias/fuzzy matching เพิ่ม
+- ถ้ามีผู้ใช้พร้อมกันจำนวนมาก อาจต้องปรับ deployment และ model serving
+
+---
+
+## 9. Recommended Model Improvement
+
+ควรทำใน experimental branch เท่านั้น ไม่แก้ production ทันที
+
+แนะนำ:
+- Hybrid Retrieval: Dense Embedding + BM25 + Entity Score
+- Cross-Encoder Reranking
+- Thai Entity Alias Matching
+- Confidence-based Fallback
+- Answer Verifier
+- Active Learning จากคำถามที่ fallback
+- Targeted LoRA/QLoRA เฉพาะ intent/query rewrite/safe style
+- RAGAS และ BERTScore evaluation
+- Ablation study เปรียบเทียบ LLM-only, RAG-only, RAG+rerank, final KB-first system
+
+ไม่แนะนำ:
+- เทรนให้โมเดลจำข้อมูลโรงพยาบาลทั้งหมด
+- เอาข้อมูลผิด/คำตอบเก่า/หมายเหตุ/log ผู้ใช้จริงเข้า training
+- ฝังตารางแพทย์หรือข้อมูลที่เปลี่ยนบ่อยลงใน model weight
+
+---
+
+## 10. Deployment Requirements
+
+Recommended:
+- Python 3.11
+- Node.js LTS
+- Ollama
+- Backend port 8000
+- Frontend port 3000
+- HTTPS/reverse proxy for production
+- Monitoring and log policy
+
+Model files such as `.gguf` should be transferred separately and should not be committed to GitHub.
+
+---
+
+## 11. Compliance Notes
+
+ระบบนี้เป็น information chatbot ไม่ใช่อุปกรณ์แพทย์ และไม่ควรใช้แทนการประเมินโดยบุคลากรทางการแพทย์  
+หากนำไปใช้จริงต้องพิจารณา PDPA, data retention, access control, audit log policy และการตรวจข้อมูลโดยเจ้าของข้อมูลของโรงพยาบาล

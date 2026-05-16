@@ -28,12 +28,18 @@ nextjs_frontend/.env.local
 *.pem
 *.crt
 cert.pem
+*service-account*.json
+*credentials*.json
 
 # Local DB / logs / runtime
 hospital_chatbot/data/chatbot_analytics.db
 hospital_chatbot/data/*.db
 hospital_chatbot/logs/
 *.log
+logs/
+*.db
+*.sqlite
+*.sqlite3
 backend_*.log
 backend_*.err.log
 frontend_*.log
@@ -42,6 +48,8 @@ frontend_*.log
 *.gguf
 *.safetensors
 *.bin
+*.pt
+*.pth
 hospital_chatbot/training/uph_lora_v*/
 hospital_chatbot/training/uph_merged_v*/
 hospital_chatbot/training/**/checkpoint*/
@@ -49,6 +57,9 @@ hospital_chatbot/training/checkpoint*/
 hospital_chatbot/training/*.gguf
 hospital_chatbot/training/*.safetensors
 hospital_chatbot/training/**/*.safetensors
+unsloth_compiled_cache/
+checkpoints/
+wandb/
 
 # Generated reports/results
 hospital_chatbot/reports/
@@ -62,12 +73,22 @@ regression_*.csv
 regression_*.json
 hospital_chatbot/regression_*.csv
 hospital_chatbot/regression_*.json
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+handover_model.zip
 
 # Local vector/model stores
 chroma_db/
 hospital_chatbot/chroma_db/
 OllamaModels/
 models/
+manifests/
+blobs/
+registry.ollama.ai/
+sha256-*
 
 # Personal/dev tools
 .claude/
